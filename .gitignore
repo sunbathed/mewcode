@@ -1,0 +1,44 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# ---- 虚拟环境 ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- 测试与覆盖率 ----
+.pytest_cache/
+.coverage
+htmlcov/
+coverage/
+
+# ---- 环境变量与密钥（占位模板 .env.example 除外）----
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+
+# ---- ZCode / 本地工具工作区文件 ----
+.zcode/
+.mewcode/
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+
+# ---- 本项目的临时/备份文件 ----
+tests/*.zip
+*.zip
