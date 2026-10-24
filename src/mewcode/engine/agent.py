@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from pathlib import Path
 
@@ -38,8 +39,12 @@ from .plan_mode import (
     build_plan_mode_tools,
     intercept_write,
 )
-from .prompt_pipeline import system_reminder_message
+from .prompt_pipeline import hook_notification_message, system_reminder_message
 from ..permission import PermissionChecker, PermissionDecision, PermissionResponse
+from ..hooks import HookContext, HookEngine, ToolRejectedError
+from ..hooks.models import LifecycleEvent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +59,12 @@ class AgentConfig:
     # 第 9 章：跨会话记忆（MEWCODE.md 指令 + 自动记忆索引）注入 system prompt
     custom_instructions: str = ""
     memory_instructions: str = ""
+    # 第 11 章：Skill 两阶段加载阶段一（轻量摘要列表，注入 system prompt）
+    skill_catalog: str = ""
+
+
+# 第 11 章：系统工具豁免 allowedTools 过滤（Skill 嵌套的关键）
+SYSTEM_TOOL_NAMES = {"LoadSkill": True}
 
 
 def _estimate_tokens(text: str) -> int:
@@ -106,6 +117,7 @@ class Agent:
         cancel_event: asyncio.Event | None = None,
         permission: PermissionChecker | None = None,
         context: ContextManager | None = None,
+        hooks: HookEngine | None = None,
     ) -> None:
         self.provider_config = config
         self.session = session
@@ -119,6 +131,25 @@ class Agent:
         self.permission = permission
         # 第八章：上下文管理器（第 1 层存盘 + 第 2 层摘要；None 表示不启用）
         self.context = context
+        # 第 12 章：Hook 引擎（生命周期事件自动化；None 表示不启用）
+        self.hooks = hooks
+        # 第 13 章：完整工具集引用（子 Agent 从它开始过滤，而非可能被
+        # Skill allowedTools 缩减过的当前 registry）与实例级用量统计
+        self._full_registry = registry
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cached_tokens = 0
+        self.total_tool_calls = 0
+        # 第 13 章：父子链路追踪标识（AgentTool 设置子 Agent 的 _trace_id）
+        self._trace_id = ""
+        self._child_trace_ids: list[str] = []
+        # 第 11 章：Skill 激活状态（env context 持久源）与工具过滤回调
+        self.skill_state = None
+        self.tool_filter = None  # callable(registry) -> ToolRegistry | None（allowedTools 过滤）
+        # 第 15 章：每轮 Agent Loop 开头的注入回调（Team 邮箱消费）。
+        # 签名 callable(turn) -> list[str]；返回的每段文本包装成
+        # system reminder 注入请求首部，模型在开始本轮思考前读到
+        self.pre_turn_inject: Callable[[int], list[str]] | None = None
         self._env = detect_environment(self.workdir, model=self.provider_config.model)
         self._cached_system_prompt: str | None = None
 
@@ -129,27 +160,67 @@ class Agent:
     def _os_name(self) -> str:
         return "Windows" if sys.platform == "win32" else ("macOS" if sys.platform == "darwin" else "Linux")
 
+    def bind_skill_context(self, skill_state, tool_filter=None) -> None:
+        """第 11 章：绑定 Skill 激活状态与 allowedTools 过滤回调（App/TUI 注入）。"""
+        self.skill_state = skill_state
+        self.tool_filter = tool_filter
+
     def _system_prompt(self) -> str:
         if self.agent_config.system_prompt:
             return self.agent_config.system_prompt
         if self._cached_system_prompt is None:
             # 第 9 章：指令文件（MEWCODE.md）与自动记忆索引作为条件注入模块进 system prompt
+            # 第 11 章：Skill 两阶段加载阶段一——轻量摘要列表也在 system prompt 里
             self._cached_system_prompt = build_system_prompt(
                 env=self._env,
                 options=BuildOptions(
                     custom_instructions=self.agent_config.custom_instructions,
                     memory_instructions=self.agent_config.memory_instructions,
+                    skill_instructions=self.agent_config.skill_catalog,
                 ),
             )
         return self._cached_system_prompt
 
     def _tools_for_request(self) -> list[dict[str, Any]]:
+        # 第 11 章：allowedTools 过滤（渐进式披露）+ 系统工具豁免 LoadSkill
+        if self.tool_filter is not None:
+            filtered_registry = self.tool_filter(self.registry)
+            if filtered_registry is not None:
+                registry = filtered_registry
+            else:
+                registry = self.registry
+        else:
+            registry = self.registry
         if self.plan_state.active:
-            return build_plan_mode_tools(self.registry)
-        return self.registry.api_specs()
+            return build_plan_mode_tools(registry)
+        return registry.api_specs()
+
+    def _skill_env_reminders(self) -> list[dict[str, Any]]:
+        """第 11 章：每轮重建 env context——已激活 Skill 的 SOP 钉到首部。
+
+        普通用户消息会随对话往上推；env context 每轮重新构建，
+        已激活的 SKILL.md 永远在最显眼的位置，不会被冲走。
+        嵌套时所有激活的 Skill 同时在场（两份 SOP 同时生效）。
+        """
+        if self.skill_state is None:
+            return []
+        sop_texts = self.skill_state.sop_texts()
+        if not sop_texts:
+            return []
+        joined = "\n\n".join(sop_texts)
+        return [system_reminder_message(f"以下 Skill 已激活，请遵循其中的 SOP：\n\n{joined}")]
 
     def _messages_for_request(self, turn: int = 1) -> list[dict[str, Any]]:
-        messages = [{"role": "system", "content": self._system_prompt()}] + self.session.api_messages()
+        # 第 11 章：env context 每轮重建，已激活 Skill 的 SOP 钉在最前
+        messages: list[dict[str, Any]] = self._skill_env_reminders()
+        # 第 12 章：Hook 的 prompt 执行器注入——以 <hook-notification> 标签
+        # 注入到请求首部，Agent 在开始本轮思考前读到，不污染对话历史
+        if self.hooks is not None:
+            for hook_message in self.hooks.get_prompt_messages():
+                if hook_message:
+                    messages.append(hook_notification_message(hook_message))
+        messages.append({"role": "system", "content": self._system_prompt()})
+        messages.extend(self.session.api_messages())
         if self.plan_state.active and self.plan_state.plan_file:
             plan_path = Path(self.plan_state.plan_file).expanduser()
             plan_exists = plan_path.exists()
@@ -159,6 +230,17 @@ class Agent:
                 iteration=turn,
             )
             messages.append(system_reminder_message(reminder))
+        # 第 15 章：Team 邮箱消费——每轮循环开头把未读的队员消息注入成
+        # system reminder，Agent 在开始本轮思考前读到（异步通信的读取点）
+        if self.pre_turn_inject is not None:
+            try:
+                injected = self.pre_turn_inject(turn)
+            except Exception:  # noqa: BLE001 - 注入失败不阻断 Agent Loop
+                logger.exception("pre_turn_inject callback failed")
+                injected = []
+            for note in injected or []:
+                if note:
+                    messages.append(system_reminder_message(note))
         # 第七章：延迟工具提示。未发现的延迟工具（如 MCP 工具）不进完整 schema，
         # 只在 system-reminder 里列出名字，模型判断需要时调用 ToolSearch 拉取定义。
         deferred = self.registry.deferred_names()
@@ -211,6 +293,11 @@ class Agent:
                 if not force_compacted:
                     outcome, compact_error = await self._try_auto_compact()
                     if compact_error:
+                        # 第 12 章：error 事件——压缩失败（$ERROR 携带失败文本）
+                        if self.hooks is not None:
+                            await self.hooks.run_hooks(
+                                LifecycleEvent.ERROR, HookContext(event_name=LifecycleEvent.ERROR, error=compact_error)
+                            )
                         yield ErrorEvent(compact_error)
                     elif outcome is not None:
                         yield ContextCompactedEvent(
@@ -224,6 +311,11 @@ class Agent:
             # Plan Mode 下每次请求的工具列表会变化，需要同步到 client（防御：非 OpenAI 兼容客户端无 tools 属性）
             if isinstance(self.client, OpenAICompatibleClient):
                 self.client.tools = self._tools_for_request()
+            # 第 12 章：pre_send 事件——消息发送给 LLM 之前（可注入 prompt 提示词）
+            if self.hooks is not None:
+                await self.hooks.run_hooks(
+                    LifecycleEvent.PRE_SEND, HookContext(event_name=LifecycleEvent.PRE_SEND)
+                )
             request_messages = self._messages_for_request(turn=turn)
             try:
                 async for event in self.client.stream(request_messages):
@@ -232,6 +324,11 @@ class Agent:
                         turn_output_tokens += _estimate_tokens(event.text)
                         yield TextChunkEvent(event.text)
             except StreamInterruptedError as exc:
+                # 第 12 章：error 事件——LLM 请求失败时触发（消息携带错误文本）
+                if self.hooks is not None:
+                    await self.hooks.run_hooks(
+                        LifecycleEvent.ERROR, HookContext(event_name=LifecycleEvent.ERROR, error=str(exc))
+                    )
                 yield ErrorEvent(str(exc))
                 yield LoopCompleteEvent(turn, AgentStopReason.INTERNAL_ERROR)
                 return
@@ -248,6 +345,12 @@ class Agent:
                             force=True,
                         )
                     except CompactError as compact_exc:
+                        # 第 12 章：error 事件——紧急压缩失败（$ERROR 携带失败文本）
+                        if self.hooks is not None:
+                            await self.hooks.run_hooks(
+                                LifecycleEvent.ERROR,
+                                HookContext(event_name=LifecycleEvent.ERROR, error=str(compact_exc)),
+                            )
                         yield ErrorEvent(str(compact_exc))
                         yield LoopCompleteEvent(turn, AgentStopReason.INTERNAL_ERROR)
                         return
@@ -260,9 +363,19 @@ class Agent:
                         )
                     turn -= 1  # 本轮请求未成功，回退轮次后重试
                     continue
+                # 第 12 章：error 事件——LLM 请求失败时触发（消息携带错误文本）
+                if self.hooks is not None:
+                    await self.hooks.run_hooks(
+                        LifecycleEvent.ERROR, HookContext(event_name=LifecycleEvent.ERROR, error=str(exc))
+                    )
                 yield ErrorEvent(str(exc))
                 yield LoopCompleteEvent(turn, AgentStopReason.INTERNAL_ERROR)
                 return
+            # 第 12 章：post_receive 事件——收到 LLM 响应之后
+            if self.hooks is not None:
+                await self.hooks.run_hooks(
+                    LifecycleEvent.POST_RECEIVE, HookContext(event_name=LifecycleEvent.POST_RECEIVE)
+                )
 
             collected = collector.result()
             turn_input_tokens = _estimate_tokens(repr(request_messages))
@@ -285,6 +398,10 @@ class Agent:
             total_input_tokens += turn_input_tokens
             total_output_tokens += turn_output_tokens
             total_cached_tokens += cached_tokens
+            # 第 13 章：同步实例级统计（子 Agent 用量经此上报给 TaskManager）
+            self.total_input_tokens = total_input_tokens
+            self.total_output_tokens = total_output_tokens
+            self.total_cached_tokens = total_cached_tokens
             yield UsageEvent(
                 turn,
                 turn_input_tokens,
@@ -307,6 +424,8 @@ class Agent:
 
             # 发出工具请求事件
             for use in collected.tool_uses:
+                # 第 13 章：实例级工具调用计数（子 Agent 追踪用）
+                self.total_tool_calls += 1
                 yield ToolUseEvent(use.id, use.name, use.input)
 
             # 第 6 章：权限检查嵌入 Agent Loop。
@@ -318,7 +437,26 @@ class Agent:
             executable: list[ToolUseBlock] = []
             blocked: dict[str, ToolResult] = {}  # use.id -> 直接拦截的工具结果
 
+            # 第 12 章：pre_tool_use Hook 先置安全拦截——逐工具在权限链之前检查。
+            # 命中 reject 的调用直接生成拦截结果（reason 即 Hook 输出），
+            # 与权限拦截走同一回填路径，不进执行列表。
+            if self.hooks is not None:
+                for use in collected.tool_uses:
+                    hook_ctx = HookContext(
+                        event_name=LifecycleEvent.PRE_TOOL_USE,
+                        tool_name=use.name,
+                        tool_args=use.input,
+                        file_path=self._hook_file_path(use),
+                    )
+                    rejection = await self.hooks.run_pre_tool_hooks(hook_ctx)
+                    if rejection is not None:
+                        self._log_rejection(rejection)
+                        blocked[use.id] = ToolResult(is_error=True, error=rejection.reason)
+
             for use, reason in zip(collected.tool_uses, plan_reasons):
+                if use.id in blocked:
+                    # Hook 拦截优先：跳过规划/权限链路
+                    continue
                 if reason is not None:
                     # 规划模式拦截：写类工具（除 plan 文件外）直接拒绝
                     blocked[use.id] = ToolResult(is_error=True, error=reason)
@@ -380,6 +518,19 @@ class Agent:
                     persisted=use.id in persisted,
                     persisted_path=persisted.get(use.id, ""),
                 )
+                # 第 12 章：post_tool_use 事件——工具执行完成之后
+                # 对被 Hook 拦截的调用也回填其 Hook 输出（模型可据此调整策略）
+                if self.hooks is not None:
+                    await self.hooks.run_hooks(
+                        LifecycleEvent.POST_TOOL_USE,
+                        HookContext(
+                            event_name=LifecycleEvent.POST_TOOL_USE,
+                            tool_name=use.name,
+                            tool_args=use.input,
+                            file_path=self._hook_file_path(use),
+                            error=result.error if result.is_error else "",
+                        ),
+                    )
 
             # 停止条件 5：连续多轮工具失败（模型可能已迷失）
             # 权限拒绝（DENY/HITL 拒绝）不算执行失败——模型看到
@@ -395,6 +546,41 @@ class Agent:
                 yield ErrorEvent(f"连续 {tool_error_turns} 轮工具调用失败，Agent 已自动停止。")
                 yield LoopCompleteEvent(turn, AgentStopReason.TOOL_ERROR_LIMIT)
                 return
+
+    # ------------------------------------------------------------------
+    # 第 13 章：RunToCompletion——子 Agent 的非交互式执行循环
+    # ------------------------------------------------------------------
+
+    async def run_to_completion(self, task: str, *, fork_conversation: Session | None = None) -> str:
+        """子 Agent 执行模式：任务直接注入，跑到底，返回最后一段文本。
+
+        与 run() 的区别：
+          - 不等待用户输入，任务从参数传入
+          - LLM 不再调用工具（end_turn）即视为任务完成，返回最后文本
+          - 工具调用权限由 AgentDef.permissionMode 决定（dontAsk 自动批准）
+          - 消费事件流但不对外广播，文本结果就地累积
+
+        fork_conversation 非空表示 Fork 路径：对话历史已由
+        build_forked_messages 构建（含 Boilerplate 与任务指令），
+        不再追加任务消息。
+        """
+        if fork_conversation is not None:
+            # Fork 路径：直接使用已构建的会话（含任务指令），run 不再注入任务
+            self.session = fork_conversation
+            prompt = ""
+        else:
+            # 任务作为 user 消息由 run() 统一写入会话（这里不重复添加）
+            prompt = task
+
+        last_text = ""
+        async for event in self.run(prompt):
+            if isinstance(event, TextChunkEvent):
+                last_text += event.text
+            elif isinstance(event, ErrorEvent):
+                last_text += f"\n（错误：{event.message}）"
+            # ToolUseEvent / ToolResultEvent 等事件只驱动循环内部状态，
+            # 子 Agent 的中间过程不需要对外可见
+        return last_text.strip()
 
     # ------------------------------------------------------------------
     # 消息持久化
@@ -449,6 +635,23 @@ class Agent:
         from ..permission import build_permission_description
 
         return build_permission_description(use.name, use.input)
+
+    # ------------------------------------------------------------------
+    # 第 12 章：Hook 辅助
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hook_file_path(use: ToolUseBlock) -> str:
+        """从工具参数里提取文件路径（WriteFile/EditFile/ReadFile 等的 path 参数）。"""
+        file_path = use.input.get("file_path") or use.input.get("path")
+        return str(file_path) if file_path else ""
+
+    @staticmethod
+    def _log_rejection(rejection: ToolRejectedError) -> None:
+        """Hook 拦截按警告记录（辅助调试：哪条规则拦了哪个调用）。"""
+        logger.warning(
+            "Hook '%s' rejected tool '%s': %s", rejection.hook_id, rejection.tool, rejection.reason
+        )
 
 
 __all__ = ["Agent", "AgentConfig", "_default_system_prompt", "_estimate_tokens"]

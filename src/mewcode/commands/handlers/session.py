@@ -70,7 +70,6 @@ SESSION_COMMAND = Command(
     type=CommandType.LOCAL,
     handler=handle_session,
     usage="/session [list|resume <id>|new|delete <id>]",
-    arg_prompt="用法：/session [list|resume <id>|new|delete <id>]",
 )
 
 __all__ = ["SESSION_COMMAND"]

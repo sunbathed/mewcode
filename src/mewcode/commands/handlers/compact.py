@@ -25,7 +25,6 @@ COMPACT_COMMAND = Command(
     type=CommandType.LOCAL,
     handler=handle_compact,
     usage="/compact [保留重点]",
-    arg_prompt="用法：/compact [保留重点]",
 )
 
 __all__ = ["COMPACT_COMMAND"]

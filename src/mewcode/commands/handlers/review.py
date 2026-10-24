@@ -31,7 +31,6 @@ REVIEW_COMMAND = Command(
     type=CommandType.PROMPT,
     handler=handle_review,
     usage="/review [额外关注点]",
-    arg_prompt="用法：/review [额外关注点]",
 )
 
 __all__ = ["REVIEW_COMMAND", "REVIEW_PROMPT"]

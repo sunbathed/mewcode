@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from .commands import (
-    KNOWN_COMMANDS,
     Command,
     CommandContext,
     CommandRegistry,
@@ -54,6 +53,10 @@ from .storage import SessionStorage, SessionStorageError
 from .terminal import SPINNER_FRAMES, Terminal
 from .tools import ToolRegistry, ToolResult
 from .mcp import MCPManager
+from .hooks import HookEngine, HookContext, load_hooks
+from .hooks.models import LifecycleEvent
+from .subagent import AgentLoader, AgentTool, TaskManager, TraceRegistry
+from .subagent.task_tools import TaskGetTool, TaskListTool
 
 
 class App:
@@ -104,11 +107,69 @@ class App:
         self._memory_tasks: list[asyncio.Task] = []
         # 第 10 章：命令框架注册中心（10 核心命令 + App 扩展命令）
         self.commands = self._build_command_registry()
+        # 第 12 章：Hook 系统（生命周期事件自动化；配置加载失败只告警不阻断启动）
+        try:
+            self.hooks = HookEngine(load_hooks(workdir=self.workdir))
+        except Exception as exc:  # noqa: BLE001 - 配置错误不阻止终端可用
+            self.terminal.error(f"Hook 配置加载失败，已跳过：{exc}")
+            self.hooks = HookEngine()
+        # 第 11 章：Skill 系统（加载器 / 激活状态 / 执行器 / LoadSkill 工具）
+        from .skills import SkillHost
+
+        self.skill_host = SkillHost(self.workdir)
+        self.skill_host.bind(self, self.registry)
+        self.skill_host.register_command(self.commands)
+        # 第 13 章：SubAgent 系统（定义加载 / 后台任务 / 父子追踪 / Agent 工具）
+        self.agent_loader = AgentLoader(project_root=self.workdir)
+        self.task_manager = TaskManager()
+        self.trace = TraceRegistry()
+        self.agent_tool = AgentTool(
+            self, self.agent_loader, self.task_manager, self.trace
+        )
+        if "Agent" not in self.registry.names():
+            self.registry.register(self.agent_tool)
+            self.registry.register(TaskListTool(self.task_manager))
+            self.registry.register(TaskGetTool(self.task_manager))
+        # 第 14 章：Worktree 文件系统隔离（生命周期管理 + 会话持久化）。
+        # 目录不是 git 仓库时 manager 仍可用，git 操作在调用时报错
+        from .worktree import WorktreeManager, load_worktree_settings
+
+        wt_settings = load_worktree_settings(self.workdir)
+        self.worktree_settings = wt_settings
+        self.worktree_manager = WorktreeManager(
+            repo_root=self.workdir,
+            symlink_directories=wt_settings.symlink_directories,
+            worktree_dir=wt_settings.worktree_dir or None,
+        )
+        restored_session = self.worktree_manager.restore_session()
+        if restored_session is not None:
+            # 上次进程退出时仍在 worktree 中：把工具根目录切回去继续工作
+            self._swap_registry_root(restored_session.worktree_path)
+            self.terminal.write(
+                f"已恢复 Worktree 会话：{restored_session.worktree_name}（{restored_session.worktree_path}）"
+            )
+        # 第 15 章：Agent Teams——团队生命周期管理 + 顶层团队工具。
+        # TeamCreate/TeamDelete/SendMessage 常驻主 Agent 工具集（Lead 的工具）；
+        # 共享任务工具只注入队员工具池与 Coordinator 模式的收窄工具集
+        from .teams import SendMessageTool, TeamCreateTool, TeamDeleteTool, TeamManager, TeammateSpawner
+
+        self.team_manager = TeamManager(worktree_manager=self.worktree_manager)
+        self.team_create_tool = TeamCreateTool(self.team_manager)
+        self.team_delete_tool = TeamDeleteTool(self.team_manager)
+        self.team_send_tool = SendMessageTool(self.team_manager, host=self, allow_resume=True)
+        for team_tool in (self.team_create_tool, self.team_delete_tool, self.team_send_tool):
+            if team_tool.name not in self.registry.names():
+                self.registry.register(team_tool)
+        self.team_spawner = TeammateSpawner(self, self.agent_tool)
+        # 第 14 章：后台过期清理任务（run_async 启动，退出时取消）
+        self._worktree_cleanup_task: asyncio.Task | None = None
         # 客户端携带注册中心启用的工具描述
         if isinstance(self.client, OpenAICompatibleClient) and self.client.tools is None:
             self.client.tools = self.registry.api_specs()
         # 供测试等待输出就绪（首行启动文案写出后置位）
         self.terminal_ready = terminal_ready if terminal_ready is not None else asyncio.Event()
+        # 第 13 章：当前运行的主 Agent 引用（AgentTool 从其继承资源；_ask 时设置）
+        self.current_agent = None
 
     def request_cancel(self) -> None:
         """用户取消：把信号传给 Agent Loop，循环在下一轮开始前干净退出。"""
@@ -412,6 +473,32 @@ class App:
             Command(name="resume", description="恢复历史会话", type=CommandType.LOCAL,
                     handler=_noop_resume, usage="/resume")
         )
+        registry.register_sync(
+            Command(name="skill", description="Skill 管理（list/info/reload）", type=CommandType.LOCAL,
+                    handler=lambda ctx: self._handle_skill_command(ParsedCommand("skill", ctx.args)),
+                    usage="/skill [list|info <名称>|reload]")
+        )
+        registry.register_sync(
+            Command(name="tasks", description="列出后台子 Agent 任务", type=CommandType.LOCAL,
+                    handler=lambda ctx: self._handle_tasks_command(ParsedCommand("tasks", ctx.args)),
+                    usage="/tasks")
+        )
+        registry.register_sync(
+            Command(name="task", description="后台任务详情（info/cancel）", type=CommandType.LOCAL,
+                    handler=lambda ctx: self._handle_task_command(ParsedCommand("task", ctx.args)),
+                    usage="/task info <ID> | /task cancel <ID>")
+        )
+        registry.register_sync(
+            Command(name="worktree", description="Git Worktree 管理（list/create/enter/exit/remove）",
+                    type=CommandType.LOCAL_UI,
+                    handler=lambda ctx: self._handle_worktree_command(ParsedCommand("worktree", ctx.args)),
+                    usage=("/worktree [list|create <名称>|enter <名称>"
+                           "|exit [remove] [--discard]|remove <名称> [--discard]]"))
+        )
+        registry.register_sync(
+            Command(name="teams", description="列出 Agent 团队与队员状态", type=CommandType.LOCAL,
+                    handler=lambda ctx: self._handle_teams_command(), usage="/teams")
+        )
         return registry
 
     def _handle_status_command(self) -> None:
@@ -447,11 +534,13 @@ class App:
             self._save()
             self.session = Session(model=self.config.model)
             self.context.reset()  # 第八章：决策冻结按会话隔离
+            self.skill_host.state.clear()  # 第 11 章：激活的 Skill 跟着对话走
             self.terminal.write(f"已创建新会话：{self.session.id}")
             return True
         if command.name == "clear":
             self.session.clear()
             self._save()
+            self.skill_host.state.clear()  # 第 11 章：清理激活的 Skill（避免 SOP 残留）
             self.terminal.write("当前会话已清空。")
             return True
         if command.name == "sessions":
@@ -496,7 +585,7 @@ class App:
         if command.name in ("permissions", "permission", "perm"):
             self._handle_permissions_command(command)
             return True
-        if command.name == "status":
+        if command.name in ("status", "s"):
             self._handle_status_command()
             return True
         if command.name == "mcp":
@@ -519,6 +608,30 @@ class App:
             # PROMPT 类型命令：触发 Agent 执行预设 prompt（异步，走 run_async 分支）
             self.terminal.write("正在发送代码审查请求…")
             return True
+        if command.name in ("compact", "c"):
+            # /compact 需异步调用 LLM 生成摘要，run_async 里 await；
+            # 这里先做无需 LLM 的前置检查（空会话直接提示）
+            if not self.session.messages:
+                self.terminal.write("当前会话还没有内容，无需压缩。")
+                return True
+            self.terminal.write("正在压缩上下文…")
+            return True
+        if command.name == "skill":
+            # /skill 需访问加载器与执行器，直接走同步方法
+            self._handle_skill_command(command)
+            return True
+        if command.name == "tasks":
+            # 第 13 章：列出后台子 Agent 任务
+            self._handle_tasks_command(command)
+            return True
+        if command.name == "task":
+            # 第 13 章：后台任务详情 / 取消
+            self._handle_task_command(command)
+            return True
+        if command.name == "teams":
+            # 第 15 章：列出团队与队员状态
+            self._handle_teams_command()
+            return True
         if command.name == "help":
             self._handle_help_command()
             return True
@@ -536,31 +649,17 @@ class App:
     def _handle_help_command(self) -> None:
         """/help：从注册中心列出所有可用命令（名称、别名、说明）。"""
         lines = ["可用命令："]
-        from .commands.handlers import ALL_COMMANDS
-
-        # 按「核心 + 扩展」顺序展示，手写别名展示保证可读性
-        rows = [
-            ("/help, /h, /?", "显示帮助信息"),
-            ("/status, /s", "显示状态信息"),
-            ("/compact, /c", "压缩上下文"),
-            ("/clear", "清除对话，创建新会话"),
-            ("/plan, /p", "切换到 Plan 模式"),
-            ("/do", "切换到执行模式"),
-            ("/session", "会话管理"),
-            ("/memory", "记忆管理"),
-            ("/permission, /perm, /permissions", "权限管理"),
-            ("/review", "审查代码变更"),
-            ("/new", "新建会话"),
-            ("/sessions", "列出历史会话"),
-            ("/use <id>", "切换会话"),
-            ("/resume", "恢复会话"),
-            ("/init", "初始化 MEWCODE.md"),
-            ("/mcp", "查看 MCP 状态"),
-            ("/exit", "保存并退出"),
-        ]
+        # 按注册顺序展示，别名来自框架命令定义
+        rows = []
+        for cmd in self.commands.list_commands():
+            if cmd.name == "exit":
+                continue  # 隐藏命令不展示
+            names = [f"/{cmd.name}"] + [f"/{a}" for a in cmd.aliases]
+            rows.append((", ".join(names), cmd.description))
         for name, desc in rows:
-            lines.append(f"  {name:<26} {desc}")
+            lines.append(f"  {name:<30} {desc}")
         lines.append("")
+        lines.append("输入 /help <命令名> 查看详细用法。")
         self.terminal.write("\n".join(lines))
 
     def _handle_permissions_command_option(self, mode: str) -> None:
@@ -571,6 +670,7 @@ class App:
         """/permissions 命令：查看或切换权限模式（第 4 层权限模式）。
 
         无参数时展示当前模式与规则统计；带参数时切换模式。
+        支持两种写法：/permissions acceptEdits（旧）或 /permission mode acceptEdits（框架）。
         """
         argument = command.argument.strip()
         if not argument:
@@ -580,6 +680,9 @@ class App:
                 f"项目规则 {len(rules.rules.project)} 条 / 用户规则 {len(rules.rules.user)} 条）"
             )
             return
+        # 兼容子命令前缀：permission mode <模式>
+        if argument.startswith("mode "):
+            argument = argument[5:].strip()
         mode = parse_mode(argument)
         if mode == self.permission.mode:
             self.terminal.write(f"当前权限模式已是 {mode.value}。")
@@ -630,6 +733,107 @@ class App:
         if not connected and not self.mcp.failures:
             self.terminal.write("MCP Server 尚未连接。")
 
+    # ------------------------------------------------------------------
+    # 第 14 章：Worktree 文件系统隔离
+    # ------------------------------------------------------------------
+
+    def _swap_registry_root(self, new_workdir: str) -> None:
+        """把工具注册中心的根目录切到 new_workdir（进入/退出 worktree 时）。
+
+        本实现的「显式 cwd」机制：核心文件工具在构造时固定根目录，
+        重建注册中心即完成切换；Agent/Task/LoadSkill/MCP 等与目录无关
+        的工具实例直接复用。切换后同步客户端工具描述。
+        """
+        from .worktree import reroot_registry
+
+        self.registry = reroot_registry(self.registry, new_workdir)
+        self._refresh_client_tools()
+
+    async def _handle_worktree_command(self, command) -> None:
+        """/worktree：Git Worktree 手动管理（list/create/enter/exit/remove）。"""
+        from .worktree import WorktreeError
+
+        parts = command.argument.split() if command.argument else []
+        sub = parts[0].lower() if parts else "list"
+        manager = self.worktree_manager
+
+        try:
+            if sub == "list":
+                self._worktree_list(manager)
+                return
+            if sub == "create":
+                if len(parts) < 2:
+                    self.terminal.error("用法：/worktree create <名称>")
+                    return
+                wt = await manager.create(parts[1], "HEAD")
+                self.terminal.write(
+                    f"已创建 worktree：{wt.name}\n  目录：{wt.path}\n  分支：{wt.branch}"
+                )
+                return
+            if sub == "enter":
+                if len(parts) < 2:
+                    self.terminal.error("用法：/worktree enter <名称>")
+                    return
+                session = await manager.enter(parts[1], session_id=self.session.id)
+                self._swap_registry_root(session.worktree_path)
+                self.terminal.write(
+                    f"已进入 worktree：{session.worktree_name}（{session.worktree_path}）\n"
+                    f"后续文件操作都发生在 worktree 中；/worktree exit 返回主目录。"
+                )
+                return
+            if sub == "exit":
+                if manager.current_session is None:
+                    self.terminal.write("当前不在任何 worktree 中。")
+                    return
+                action = "remove" if len(parts) > 1 and parts[1].lower() == "remove" else "keep"
+                discard = "--discard" in parts[1:]
+                name = manager.current_session.worktree_name
+                wt_path = manager.current_session.worktree_path
+                await manager.exit(name, action=action, discard_changes=discard)
+                self._swap_registry_root(self.workdir)
+                if action == "remove":
+                    self.terminal.write(f"已退出并删除 worktree：{name}（{wt_path}）")
+                else:
+                    self.terminal.write(
+                        f"已退出 worktree：{name}（目录保留在 {wt_path}，可再次 enter 或手动 remove）"
+                    )
+                return
+            if sub == "remove":
+                if len(parts) < 2:
+                    self.terminal.error("用法：/worktree remove <名称> [--discard]")
+                    return
+                discard = "--discard" in parts[2:]
+                await manager.remove(parts[1], discard_changes=discard)
+                if manager.current_session is None:
+                    self._swap_registry_root(self.workdir)
+                self.terminal.write(f"已删除 worktree：{parts[1]}")
+                return
+            self.terminal.error(
+                "用法：/worktree [list|create <名称>|enter <名称>|exit [remove] [--discard]"
+                "|remove <名称> [--discard]]"
+            )
+        except WorktreeError as exc:
+            self.terminal.error(f"Worktree 操作失败：{exc}")
+
+    def _worktree_list(self, manager) -> None:
+        """/worktree list：列出所有 worktree 与当前所在位置。"""
+        session = manager.current_session
+        worktrees = manager.list_worktrees()
+        if not worktrees:
+            self.terminal.write("当前没有 worktree。用 /worktree create <名称> 创建。")
+            return
+        lines = ["Worktrees", "─────────────"]
+        for wt in worktrees:
+            marker = ""
+            if session is not None and session.worktree_path == wt.path:
+                marker = "（当前所在）"
+            elif session is not None and session.worktree_name == wt.name:
+                marker = "（当前所在）"
+            lines.append(f"  {wt.name}  分支 {wt.branch}{marker}")
+            lines.append(f"    {wt.path}")
+        self.terminal.write("\n".join(lines))
+
+
     async def _handle_compact_command(self) -> None:
         """第 8 章：/compact 手动压缩——显示压缩前后的 Token 变化。
 
@@ -657,22 +861,49 @@ class App:
         """第四章：以 Agent Loop 引擎驱动一轮用户消息，事件流驱动 UI 渲染。"""
         instructions = load_instructions(self.workdir)
         memory_index = self.memory.load_index() if self.auto_memory else ""
+        # 第 11 章：Skill 两阶段加载阶段一——轻量摘要列表注入 system prompt
+        skill_catalog = self.skill_host.loader.catalog_text() if getattr(self.skill_host, "loader", None) else ""
+        # 第 15 章：Coordinator Mode 双锁——feature flag（config.yaml）+ 环境变量。
+        # 激活后收窄本轮 Agent 的工具集（无 WriteFile/EditFile）并注入四阶段工作流提示词
+        registry_for_run = self.registry
+        if self._coordinator_mode_active():
+            registry_for_run = self._build_coordinator_registry()
+            instructions = (
+                instructions
+                + "\n\n"
+                + get_coordinator_system_prompt()
+                + "\n"
+                + get_coordinator_user_context()["workerToolsContext"]
+            )
+        # 第 12 章：turn_start 事件——用户发送新消息时触发
+        if self.hooks is not None:
+            await self.hooks.run_hooks(
+                LifecycleEvent.TURN_START, HookContext(event_name=LifecycleEvent.TURN_START, message=text)
+            )
         agent = Agent(
             self.config,
             session=self.session,
-            registry=self.registry,
+            registry=registry_for_run,
             workdir=self.workdir,
             client=self.client,
             agent_config=AgentConfig(
                 max_iterations=self.max_iterations,
                 custom_instructions=instructions,
                 memory_instructions=memory_index,
+                skill_catalog=skill_catalog,
             ),
             plan_state=self.plan_state,
             cancel_event=self.cancel_event,
             permission=self.permission,
             context=self.context,
+            hooks=self.hooks,
         )
+        # 第 11 章：绑定 Skill 激活状态 + allowedTools 过滤（env context 每轮重建）
+        agent.bind_skill_context(self.skill_host.state, tool_filter=self._skill_tool_filter)
+        # 第 15 章：每轮循环开头消费 Lead 邮箱（队员空闲通知 / 消息注入 system reminder）
+        agent.pre_turn_inject = self._drain_lead_mailbox
+        # 第 13 章：登记当前主 Agent（AgentTool 从它继承资源），退出时清除
+        self.current_agent = agent
         # 工具卡片标签：tool_use_id -> 渲染行
         pending_labels: dict[str, str] = {}
         spinner_task: asyncio.Task | None = None
@@ -724,48 +955,343 @@ class App:
                 spinner_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await spinner_task
+            self.current_agent = None
             self._save()
             self._schedule_memory_extraction()
+            # 第 13 章：轮次结束后拉取已完成的子 Agent 任务，把结果
+            # 以 task-notification 形式注入主对话（不打断当前对话）。
+            # 结果回流后，模型下轮可见子 Agent 的产出，用户也可以要求
+            # 展示或基于它继续工作。
+            self._collect_task_notifications()
+            # 第 12 章：turn_end 事件——Agent 完成回复时触发
+            if self.hooks is not None:
+                await self.hooks.run_hooks(
+                    LifecycleEvent.TURN_END, HookContext(event_name=LifecycleEvent.TURN_END, message=text)
+                )
+
+    def _collect_task_notifications(self) -> None:
+        """把已完成的后台子 Agent 结果注入主对话并提示（异步回传）。"""
+        completed = self.task_manager.poll_completed()
+        if not completed:
+            return
+        from .session import TextBlock
+
+        for task in completed:
+            if not task.result:
+                continue
+            notice = (
+                f"<task-notification>\n"
+                f"后台任务 {task.name}（{task.id}）已完成，状态：{task.status}。\n"
+                f"结果：\n{task.result}\n"
+                f"</task-notification>"
+            )
+            self.session.add_message("user", notice, blocks=[TextBlock(text=notice)])
+            self.terminal.write(f"⏱ 后台任务 {task.name}（{task.id}）已完成：{task.status}")
+
+    # ------------------------------------------------------------------
+    # 第 15 章：Agent Teams——Coordinator Mode / Lead 邮箱 / 团队命令
+    # ------------------------------------------------------------------
+
+    def _coordinator_mode_active(self) -> bool:
+        """双锁判定：feature flag（config.yaml）+ 环境变量（用户显式 opt-in）。"""
+        from .teams import coordinator_env_enabled, coordinator_feature_enabled
+
+        return coordinator_feature_enabled(self.workdir) and coordinator_env_enabled()
+
+    def _lead_task_store_provider(self):
+        """Lead 侧共享任务工具的 store provider：按当前活跃团队动态解析。"""
+        from .teams import TeamError
+
+        team_name = self.team_manager.active_team_name
+        store = self.team_manager.get_task_store(team_name) if team_name else None
+        if store is None:
+            raise TeamError("当前没有活跃团队：先用 TeamCreate 创建团队。")
+        return store
+
+    def _build_coordinator_registry(self):
+        """Coordinator 模式的收窄注册中心（不改动宿主完整工具集）。"""
+        from .teams import build_coordinator_registry, build_team_task_tools
+
+        team_tools: dict[str, Any] = {
+            self.team_create_tool.name: self.team_create_tool,
+            self.team_delete_tool.name: self.team_delete_tool,
+            self.team_send_tool.name: self.team_send_tool,
+        }
+        for task_tool in build_team_task_tools(self._lead_task_store_provider):
+            team_tools[task_tool.name] = task_tool
+        return build_coordinator_registry(self.registry, team_tools)
+
+    def _drain_lead_mailbox(self, turn: int) -> list[str]:
+        """Agent Loop 每轮开头消费 Lead 邮箱（空闲通知 / 队员消息 → system reminder）。"""
+        from .teams import format_mailbox_digest
+
+        digest_parts: list[str] = []
+        try:
+            teams = self.team_manager.list_teams()
+        except Exception:  # noqa: BLE001 - 邮箱消费失败不阻断对话
+            return []
+        for team in teams:
+            mailbox = self.team_manager.get_mailbox(team.name)
+            if mailbox is None:
+                continue
+            digest = format_mailbox_digest(mailbox.consume(team.lead_agent_id))
+            if digest:
+                digest_parts.append(f"[团队 {team.name}]\n{digest}")
+        joined = "\n\n".join(digest_parts)
+        return [joined] if joined else []
+
+    def _handle_teams_command(self) -> None:
+        """/teams：列出全部团队与队员状态。"""
+        from .teams.models import TeammateInfo
+
+        teams = self.team_manager.list_teams()
+        if not teams:
+            self.terminal.write("当前没有团队。对话里让 Agent 用 TeamCreate 创建。")
+            return
+        state_text = {True: "工作中", False: "空闲", None: "未开始"}
+        for team in teams:
+            self.terminal.write(
+                f"团队 {team.name}（lead={team.lead_agent_id}）— {team.description or '（无描述）'}"
+            )
+            if not team.members:
+                self.terminal.write("  （无队员）")
+            for member in team.members:
+                self.terminal.write(
+                    f"  - {member.name} [{member.agent_id}] {member.agent_type} "
+                    f"@{member.backend_type} {state_text[member.is_active]}"
+                    f" worktree={member.worktree_path}"
+                )
 
     async def run_async(self) -> None:
+        # 第 12 章：startup + session_start 事件——MewCode 启动、新会话开始时触发
+        if self.hooks is not None:
+            await self.hooks.run_hooks(LifecycleEvent.STARTUP, HookContext(event_name=LifecycleEvent.STARTUP))
+            await self.hooks.run_hooks(
+                LifecycleEvent.SESSION_START, HookContext(event_name=LifecycleEvent.SESSION_START)
+            )
+        # 第 14 章：后台过期 worktree 清理任务（先 sleep 再清理，退出时取消）
+        from .worktree import start_stale_cleanup_task
+
+        self._worktree_cleanup_task = asyncio.create_task(
+            start_stale_cleanup_task(
+                self.worktree_manager,
+                self.worktree_settings.cleanup_interval_seconds,
+                self.worktree_settings.stale_cutoff_hours,
+            )
+        )
         self.terminal.write(f"MewCode 已启动，会话：{self.session.id}。输入 /exit 退出。")
         self.terminal_ready.set()
         # 第七章：启动时后台连接 MCP Server（失败不阻塞，只告警）
         await self.setup_mcp()
-        while True:
-            try:
-                text = self.terminal.prompt().strip()
-            except (EOFError, KeyboardInterrupt):
-                self.terminal.write()
-                self._save()
-                self._cancel_memory_tasks()
-                return
-            if not text:
-                continue
-            # 第 9 章：显式记忆——「记住 X」直接写入记忆文件，不走 Agent 对话
-            if self._remember_prompt(text):
-                continue
-            command = parse_command(text)
-            if command is not None:
-                # 第 8 章：/compact 需异步调用 LLM 生成摘要，单独走异步分支
-                if command.name == "compact":
-                    await self._handle_compact_command()
-                elif command.name == "resume":
-                    await self._handle_resume_command(command)
-                elif command.name == "review":
-                    # 第 10 章：PROMPT 类型命令——把审查 prompt 发给 Agent
-                    from .commands.handlers.review import REVIEW_PROMPT
-
-                    prompt = REVIEW_PROMPT
-                    if command.argument:
-                        prompt += f"\n\n额外关注：{command.argument}"
-                    await self._ask(prompt)
-                elif not self._handle_command(command):
+        try:
+            while True:
+                try:
+                    text = self.terminal.prompt().strip()
+                except (EOFError, KeyboardInterrupt):
+                    self.terminal.write()
+                    self._save()
                     self._cancel_memory_tasks()
                     return
-                continue
-            await self._ask(text)
+                if not text:
+                    continue
+                # 第 9 章：显式记忆——「记住 X」直接写入记忆文件，不走 Agent 对话
+                if self._remember_prompt(text):
+                    continue
+                command = parse_command(text)
+                if command is not None:
+                    # 第 8 章：/compact 需异步调用 LLM 生成摘要，单独走异步分支
+                    if command.name == "compact":
+                        await self._handle_compact_command()
+                    elif command.name == "resume":
+                        await self._handle_resume_command(command)
+                    elif command.name == "worktree":
+                        # 第 14 章：Worktree 管理是异步操作（git 子进程），单独走异步分支
+                        await self._handle_worktree_command(command)
+                    elif command.name == "review":
+                        # 第 11 章：/review 升级为 Skill（fork 模式，隔离上下文客观审查）
+                        result = await self.skill_host.execute_skill("review", command.argument)
+                        if result.text:
+                            self.terminal.write(result.text)
+                    elif self.skill_host.executor is not None and self._is_skill_command(command.name):
+                        # 第 11 章：Skill 自动注册的 PROMPT 命令（/commit、/test …）
+                        result = await self.skill_host.execute_skill(command.name, command.argument)
+                        if result.text:
+                            self.terminal.write(result.text)
+                    elif not self._handle_command(command):
+                        self._cancel_memory_tasks()
+                        return
+                    continue
+                await self._ask(text)
+        finally:
+            # 第 12 章：shutdown + session_end 事件——退出时兜底触发（含 /exit 路径）
+            if self.hooks is not None:
+                await self.hooks.run_hooks(LifecycleEvent.SESSION_END, HookContext(event_name=LifecycleEvent.SESSION_END))
+                await self.hooks.run_hooks(LifecycleEvent.SHUTDOWN, HookContext(event_name=LifecycleEvent.SHUTDOWN))
+                self.hooks.shutdown()
+            # 第 14 章：停掉后台过期清理任务
+            if self._worktree_cleanup_task is not None:
+                self._worktree_cleanup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._worktree_cleanup_task
+                self._worktree_cleanup_task = None
+            # 第 13 章：退出时取消所有仍在运行的后台子 Agent 任务
+            self.task_manager.shutdown()
+            self._collect_task_notifications()
+            # 第 15 章：停掉所有仍在运行的 in-process 队员
+            self.team_manager.shutdown()
 
+    def _is_skill_command(self, name: str) -> bool:
+        """判断某个命令名是否为 Skill 自动注册的命令（非内置命令）。"""
+        cmd = self.commands.find(name)
+        if cmd is None:
+            return False
+        # Skill 注册的命令描述带 [skill] 标记
+        return "[skill]" in (cmd.description or "")
+
+
+    def _handle_skill_command(self, command) -> None:
+        """/skill：管理 Skill（list / info <名称> / reload）。"""
+        parts = command.argument.split(maxsplit=1) if command.argument else []
+        sub = parts[0].lower() if parts else "list"
+        host = self.skill_host
+        if sub == "list":
+            skills = host.loader.load_catalog()
+            if not skills:
+                self.terminal.write("暂无 Skill。可放入 ~/.mewcode/skills/ 或 项目根/.mewcode/skills/。")
+                return
+            lines = ["已加载 Skill："]
+            for skill in sorted(skills, key=lambda s: s.source_rank):
+                marker = "项目" if skill.source_rank == 0 else "用户" if skill.source_rank == 1 else "内置"
+                lines.append(f"  {skill.name:<16} [{marker}] {skill.description}")
+            lines.append(f"（共 {len(skills)} 个）")
+            self.terminal.write("\n".join(lines))
+        elif sub == "info":
+            if len(parts) < 2:
+                self.terminal.write(command_usage(command))
+                return
+            name = parts[1].strip().lower()
+            try:
+                skill = host.loader.get(name)
+            except Exception as exc:
+                self.terminal.error(str(exc))
+                return
+            lines = [
+                f"名称：{skill.name}",
+                f"描述：{skill.description}",
+                f"模式：{skill.mode}（context={skill.context}）",
+                f"模型：{skill.model or '默认'}",
+                f"来源：{skill.source}",
+                f"允许工具：{', '.join(skill.allowed_tools) if skill.allowed_tools else '（全部）'}",
+                "",
+                "--- SOP ---",
+                skill.prompt_body,
+            ]
+            self.terminal.write("\n".join(lines))
+        elif sub == "reload":
+            names = host.reload()
+            self.terminal.write(f"已重新扫描 Skill：{', '.join(names) if names else '（无）'}")
+        else:
+            self.terminal.error(command_usage(command))
+
+    def _handle_tasks_command(self, command) -> None:
+        """第 13 章：/tasks——列出后台子 Agent 任务与调用链。"""
+        tasks = self.task_manager.list_tasks()
+        lines = [f"后台任务（共 {len(tasks)} 个）："]
+        if not tasks:
+            lines.append("  （无）")
+        for task in tasks:
+            elapsed = task.end_time - task.start_time if task.end_time is not None else None
+            duration = f"{elapsed:.1f}s" if elapsed is not None else "进行中"
+            tokens = task.progress.input_tokens + task.progress.output_tokens
+            lines.append(f"  [{task.id}] {task.name} — {task.status}（{duration}，{tokens} token）")
+        lines.append("")
+        lines.append(self.trace.tree_text())
+        self.terminal.write("\n".join(lines))
+
+    def _handle_task_command(self, command) -> None:
+        """/task：后台任务详情（info <ID>）/ 取消（cancel <ID>）。"""
+        parts = command.argument.split(maxsplit=2) if command.argument else []
+        if not parts or len(parts) < 2:
+            self.terminal.error(command_usage(command))
+            return
+        action, task_id = parts[0].lower(), parts[1].strip()
+        task = self.task_manager.get(task_id)
+        if task is None:
+            self.terminal.error(f"任务不存在：{task_id}")
+            return
+        if action in ("info", "show"):
+            elapsed = task.end_time - task.start_time if task.end_time is not None else None
+            duration = f"{elapsed:.1f}s" if elapsed is not None else "进行中"
+            lines = [
+                f"任务：{task.id}（{task.name}）",
+                f"状态：{task.status}",
+                f"耗时：{duration}",
+                f"Token：{task.progress.input_tokens + task.progress.output_tokens}",
+            ]
+            if task.result:
+                lines.append("--- 结果 ---")
+                lines.append(task.result)
+            self.terminal.write("\n".join(lines))
+        elif action == "cancel":
+            if task.status == "running":
+                self.task_manager.cancel(task_id)
+                self.terminal.write(f"已请求取消任务：{task_id}")
+            else:
+                self.terminal.write(f"任务 {task_id} 已结束（{task.status}），无需取消。")
+        else:
+            self.terminal.error(command_usage(command))
+
+    def _skill_tool_filter(self, registry) -> Any:
+        """allowedTools 过滤回调（Agent 每轮构建工具列表时调用）。
+
+        返回过滤后的注册中心；空白名单返回 None（不限制，用完整工具集）。
+        """
+        host = self.skill_host
+        # 收集所有激活 Skill 并集的 allowedTools（激活状态里记录的是已渲染 SOP）
+        # 简化：active 状态不直接存白名单，这里由 SkillHost 依据激活记录重建
+        return host.filter_registry_by_active()
+
+    async def _run_sub_agent(self, skill, prompt: str, context_messages: list, host) -> str:
+        """fork 模式：开一个独立子 Agent 执行，收集文本结果返回。"""
+        from .session import Session, TextBlock
+
+        sub_session = Session(model=skill.model or self.config.model)
+        # 按 skill.context 决定带多少主对话上下文
+        if skill.context == "recent":
+            for msg in context_messages[-5:]:
+                sub_session.messages.append(msg)
+        elif skill.context == "full":
+            for msg in context_messages:
+                sub_session.messages.append(msg)
+        # context: none 不带任何历史
+
+        # allowedTools 过滤工具集（LoadSkill 始终可见）
+        filtered_registry = self.skill_host.filter_registry(skill.allowed_tools) or self.registry
+        agent = Agent(
+            self.config,
+            session=sub_session,
+            registry=filtered_registry,
+            workdir=self.workdir,
+            client=self.client,  # 复用宿主 client（真实场景共享连接，测试场景用 fake）
+            agent_config=AgentConfig(max_iterations=self.max_iterations),
+            plan_state=self.plan_state,
+            cancel_event=self.cancel_event,
+            permission=self.permission,
+        )
+        agent.bind_skill_context(self.skill_host.state, tool_filter=self._skill_tool_filter)
+
+        collected: list[str] = []
+        async for event in agent.run(prompt):
+            if isinstance(event, TextChunkEvent):
+                collected.append(event.text)
+            elif isinstance(event, ErrorEvent):
+                collected.append(f"（错误：{event.message}）")
+        # fork 结果回流主对话：作为一条 assistant 消息塞回去
+        result_text = "".join(collected)
+        if result_text:
+            self.session.add_message("assistant", result_text, blocks=[TextBlock(text=result_text)])
+            self._save()
+        return result_text
 
 class TerminalUIController:
     """第 10 章：终端版 UIController——命令 handler 与 UI 的接口。

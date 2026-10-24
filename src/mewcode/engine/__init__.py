@@ -46,7 +46,7 @@ from .plan_mode import (
     read_plan_file,
     save_plan_file,
 )
-from .prompt_pipeline import assemble_api_payload, system_reminder_message
+from .prompt_pipeline import assemble_api_payload, hook_notification_message, system_reminder_message
 
 __all__ = [
     "Agent",
@@ -81,6 +81,7 @@ __all__ = [
     "detect_environment",
     "ensure_plan_dir",
     "execute_batches",
+    "hook_notification_message",
     "intercept_write",
     "list_plan_files",
     "parse_tool_arguments",

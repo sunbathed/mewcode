@@ -16,6 +16,10 @@
   即使模型不听话，Ask 机制仍会弹出确认框。
 - bypassPermissions：跳过第 3-5 层（规则、模式、HITL），但黑名单和沙箱仍生效。
 
+第 13 章：dontAsk 是 bypassPermissions 的语义别名（子 Agent 用）——
+Fork 默认、自定义 Agent 可配。子 Agent 跑在后台没有 UI 可弹确认框，
+而 disallowedTools 已锁死能力边界（排除写工具与命令），自动批准安全。
+
 决策矩阵本身就是决策逻辑的完整表达，按表对照写判断即可。
 """
 
@@ -37,7 +41,8 @@ class PermissionMode(enum.StrEnum):
     BYPASS_PERMISSIONS = "bypassPermissions"
 
 
-# 别名：实战篇验证里把 bypassPermissions 叫做 YOLO 模式
+# 别名：实战篇验证里把 bypassPermissions 叫做 YOLO 模式；
+# 第 13 章子 Agent 用 dontAsk（后台无 UI 可弹确认框）
 # 键统一全小写，parse_mode 入参会先 lower() 再匹配
 MODE_ALIASES: dict[str, PermissionMode] = {
     "default": PermissionMode.DEFAULT,
@@ -49,6 +54,7 @@ MODE_ALIASES: dict[str, PermissionMode] = {
     "bypass_permissions": PermissionMode.BYPASS_PERMISSIONS,
     "bypass": PermissionMode.BYPASS_PERMISSIONS,
     "yolo": PermissionMode.BYPASS_PERMISSIONS,
+    "dontask": PermissionMode.BYPASS_PERMISSIONS,
 }
 
 
@@ -82,7 +88,8 @@ def infer_safety(tool_name: str, safety_map: dict[str, str] | None = None) -> st
     """
     if safety_map and tool_name in safety_map:
         return safety_map[tool_name]
-    if tool_name in ("ReadFile", "Glob", "Grep"):
+    if tool_name in ("ReadFile", "Glob", "Grep", "LoadSkill", "ToolSearch"):
+        # LoadSkill / ToolSearch：系统工具，只改 Agent 内部状态，走只读通道
         return SAFETY_READ
     if tool_name in ("WriteFile", "EditFile", "ReplaceInFile"):
         return SAFETY_WRITE

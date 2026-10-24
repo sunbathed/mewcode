@@ -52,7 +52,6 @@ MEMORY_COMMAND = Command(
     type=CommandType.LOCAL,
     handler=handle_memory,
     usage="/memory [show|list|add <内容>|clear|path]",
-    arg_prompt="用法：/memory [show|list|add <内容>|clear|path]",
 )
 
 __all__ = ["MEMORY_COMMAND"]

@@ -23,7 +23,6 @@ PLAN_COMMAND = Command(
     type=CommandType.LOCAL_UI,
     handler=handle_plan,
     usage="/plan [任务描述]",
-    arg_prompt="用法：/plan [任务描述]",
 )
 
 __all__ = ["PLAN_COMMAND"]

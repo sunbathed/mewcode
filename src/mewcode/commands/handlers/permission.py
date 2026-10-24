@@ -65,7 +65,6 @@ PERMISSION_COMMAND = Command(
     type=CommandType.LOCAL,
     handler=handle_permission,
     usage="/permission [mode|rules|add|reset]",
-    arg_prompt="用法：/permission [mode|rules|add|reset]",
 )
 
 __all__ = ["PERMISSION_COMMAND"]

@@ -15,6 +15,20 @@ def system_reminder_message(content: str) -> dict[str, Any]:
     }
 
 
+def hook_notification_message(content: str) -> dict[str, Any]:
+    """生成 Hook prompt 执行器注入的 <hook-notification> 标签消息。
+
+    与 generic 的 <system-reminder> 区分开：Hook 注入的提示词可以被
+    模型识别为「运行期钩子的动态指令」，不污染对话历史的结构，
+    也让 prompt 来源（Skill / Hook / Plan Mode）在请求里可追踪。
+    """
+    clean_content = content.strip()
+    return {
+        "role": "user",
+        "content": f"<hook-notification>\n{clean_content}\n</hook-notification>",
+    }
+
+
 def assemble_api_payload(
     system_prompt: str,
     messages: list[dict[str, Any]],
@@ -48,6 +62,7 @@ def assemble_api_payload(
 
 
 __all__ = [
+    "hook_notification_message",
     "system_reminder_message",
     "assemble_api_payload",
 ]

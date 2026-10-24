@@ -51,7 +51,6 @@ STATUS_COMMAND = Command(
     type=CommandType.LOCAL,
     handler=handle_status,
     usage="/status",
-    arg_prompt="用法：/status",
 )
 
 __all__ = ["STATUS_COMMAND"]

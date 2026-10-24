@@ -23,7 +23,6 @@ CLEAR_COMMAND = Command(
     type=CommandType.LOCAL_UI,
     handler=handle_clear,
     usage="/clear",
-    arg_prompt="用法：/clear",
 )
 
 __all__ = ["CLEAR_COMMAND"]

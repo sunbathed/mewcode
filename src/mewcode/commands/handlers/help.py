@@ -48,7 +48,6 @@ HELP_COMMAND = Command(
     type=CommandType.LOCAL,
     handler=handle_help,
     usage="/help [命令名]",
-    arg_prompt="用法：/help [命令名]",
 )
 
 __all__ = ["HELP_COMMAND"]

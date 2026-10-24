@@ -62,6 +62,7 @@ KNOWN_COMMANDS: set[str] = (
     {cmd.name for cmd in ALL_COMMANDS}
     | {alias for cmd in ALL_COMMANDS for alias in cmd.aliases}
     | LEGACY_COMMANDS
+    | {"skill", "worktree"}
 )
 
 
@@ -93,6 +94,8 @@ def command_usage(command: ParsedCommand | None) -> str:
         "mcp": "/mcp 不需要参数",
         "exit": "/exit 不需要参数",
         "resume": "用法：/resume 展示会话列表并选择恢复",
+        "skill": "用法：/skill [list|info <名称>|reload]",
+        "worktree": "用法：/worktree [list|create <名称>|enter <名称>|exit [remove] [--discard]|remove <名称> [--discard]]",
     }
     if name in usage_by_name:
         return usage_by_name[name]

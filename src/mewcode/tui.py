@@ -34,6 +34,8 @@ from .llm_client import (
     ToolUseStart,
 )
 from .memory import MemoryManager, MemoryManagerError, load_instructions
+from .hooks import HookContext
+from .hooks.models import LifecycleEvent
 from .permission import (
     MODE_ALIASES,
     PermissionChecker,
@@ -60,6 +62,23 @@ MASCOT_ART = """  ▄     ▄
  █ █   █ █
  █▀▀▀▀▀▀▀█
  ▀ ▀   ▀ ▀"""
+
+
+class CommandInput(Input):
+    """带 Tab 补全绑定的输入框。
+
+    Tab 在 widget 层绑定，优先级高于 Screen 默认的 focus_next，
+    保证输入命令时按 Tab 一定进入补全弹窗。
+    """
+
+    BINDINGS = [
+        ("tab", "complete_command", "命令补全"),
+    ]
+
+    def action_complete_command(self) -> None:
+        tui = self.app  # MewCodeTUI
+        if self.value.startswith("/"):
+            tui.completion_popup.show(self.value)
 
 
 class PermissionModal(ModalScreen[PermissionResponse]):
@@ -261,7 +280,6 @@ class MewCodeTUI(TextualApp[None]):
     BINDINGS = [
         ("ctrl+c", "quit", "退出"),
         ("f1", "show_help", "帮助"),
-        ("tab", "command_complete", "命令补全"),
         ("escape", "dismiss_completion", "关闭补全"),
     ]
 
@@ -304,9 +322,58 @@ class MewCodeTUI(TextualApp[None]):
         from .context import ContextManager
 
         self.context = ContextManager(config, workdir=self.workdir)
+        # 第 11 章：Skill 系统（加载器 / 激活状态 / 执行器 / LoadSkill 工具）
+        from .skills import SkillHost
+
+        self.skill_host = SkillHost(self.workdir)
+        self.skill_host.bind(self, self.registry)
+        self.skill_host.register_command(self.commands)
+        # 第 12 章：Hook 系统（生命周期事件自动化；配置加载失败只告警不阻断启动）
+        from .hooks import HookEngine, load_hooks
+
+        try:
+            self.hooks = HookEngine(load_hooks(workdir=self.workdir))
+        except Exception as exc:  # noqa: BLE001 - 配置错误不阻止 UI 可用
+            self._system(f"Hook 配置加载失败，已跳过：{exc}")
+            self.hooks = HookEngine()
         self.session = storage.latest() or Session(model=config.model)
         if not self.session.model:
             self.session.model = config.model
+        # 第 13 章：SubAgent 系统（定义加载 / 后台任务 / 父子追踪 / Agent 工具）
+        from .subagent import AgentLoader, AgentTool, TaskManager, TraceRegistry
+        from .subagent.task_tools import TaskGetTool, TaskListTool
+
+        self.agent_loader = AgentLoader(project_root=self.workdir)
+        self.task_manager = TaskManager()
+        self.trace = TraceRegistry()
+        self.agent_tool = AgentTool(self, self.agent_loader, self.task_manager, self.trace)
+        if "Agent" not in self.registry.names():
+            self.registry.register(self.agent_tool)
+            self.registry.register(TaskListTool(self.task_manager))
+            self.registry.register(TaskGetTool(self.task_manager))
+        # 第 14 章：Worktree 管理（队员的文件系统隔离；目录不是 git 仓库时错误延迟到调用）
+        from .worktree import WorktreeManager, load_worktree_settings
+
+        self.worktree_settings = load_worktree_settings(self.workdir)
+        self.worktree_manager = WorktreeManager(
+            repo_root=self.workdir,
+            symlink_directories=self.worktree_settings.symlink_directories,
+            worktree_dir=self.worktree_settings.worktree_dir or None,
+        )
+        # 第 15 章：Agent Teams——团队生命周期管理 + 顶层团队工具（Lead 的工具）
+        from .teams import SendMessageTool, TeamCreateTool, TeamDeleteTool, TeamManager, TeammateSpawner
+
+        self.team_manager = TeamManager(worktree_manager=self.worktree_manager)
+        self.team_create_tool = TeamCreateTool(self.team_manager)
+        self.team_delete_tool = TeamDeleteTool(self.team_manager)
+        self.team_send_tool = SendMessageTool(self.team_manager, host=self, allow_resume=True)
+        for team_tool in (self.team_create_tool, self.team_delete_tool, self.team_send_tool):
+            if team_tool.name not in self.registry.names():
+                self.registry.register(team_tool)
+        self.team_spawner = TeammateSpawner(self, self.agent_tool)
+        # 第 15 章：Coordinator Mode 的收窄注册中心（_ask 期间临时设置）
+        self._coordinator_registry = None
+        self.current_agent = None  # TUI 无 engine.Agent，保持 None（宿主直取资源）
         self._busy = False
         self._card_tasks: dict[int, asyncio.Task[None]] = {}
 
@@ -334,6 +401,7 @@ class MewCodeTUI(TextualApp[None]):
         async def _clear(ctx) -> None:
             self.session.clear()
             self._save()
+            self.skill_host.state.clear()  # 第 11 章：清理激活的 Skill（避免 SOP 残留）
             await self._render_session()
             await self._system("当前会话已清空")
 
@@ -374,12 +442,10 @@ class MewCodeTUI(TextualApp[None]):
             await self._handle_compact_command(ctx.args)
 
         async def _review(ctx) -> None:
-            from .commands.handlers.review import REVIEW_PROMPT
-
-            prompt = REVIEW_PROMPT
-            if ctx.args:
-                prompt += f"\n\n额外关注：{ctx.args}"
-            await self._ask(prompt)
+            # 第 11 章：/review 升级为 Skill（fork 模式，隔离上下文客观审查）
+            result = await self.skill_host.execute_skill("review", ctx.args)
+            if result.text:
+                await self._system(result.text)
 
         tui_handlers = [
             (HELP_COMMAND, _help),
@@ -472,13 +538,165 @@ class MewCodeTUI(TextualApp[None]):
                 usage="/resume",
             )
         )
+        registry.register_sync(
+            Command(
+                name="skill",
+                description="Skill 管理（list/info/reload）",
+                type=CommandType.LOCAL,
+                handler=lambda ctx: self._handle_skill_command(ParsedCommand("skill", ctx.args)),
+                usage="/skill [list|info <名称>|reload]",
+            )
+        )
+        # 第 13 章：后台子 Agent 任务命令
+        registry.register_sync(
+            Command(
+                name="tasks",
+                description="列出后台子 Agent 任务",
+                type=CommandType.LOCAL,
+                handler=lambda ctx: self._handle_tasks_command(ParsedCommand("tasks", ctx.args)),
+                usage="/tasks",
+            )
+        )
+        registry.register_sync(
+            Command(
+                name="task",
+                description="后台任务详情（info/cancel）",
+                type=CommandType.LOCAL,
+                handler=lambda ctx: self._handle_task_command(ParsedCommand("task", ctx.args)),
+                usage="/task info <ID> | /task cancel <ID>",
+            )
+        )
+        # 第 15 章：团队与队员状态命令
+        registry.register_sync(
+            Command(
+                name="teams",
+                description="列出 Agent 团队与队员状态",
+                type=CommandType.LOCAL,
+                handler=lambda ctx: self._handle_teams_command(),
+                usage="/teams",
+            )
+        )
         return registry
+
+    async def _handle_teams_command(self) -> None:
+        """TUI 版 /teams：列出全部团队与队员状态。"""
+        teams = self.team_manager.list_teams()
+        if not teams:
+            await self._system("当前没有团队。对话里让 Agent 用 TeamCreate 创建。")
+            return
+        state_text = {True: "工作中", False: "空闲", None: "未开始"}
+        lines: list[str] = []
+        for team in teams:
+            lines.append(f"团队 {team.name}（lead={team.lead_agent_id}）— {team.description or '（无描述）'}")
+            if not team.members:
+                lines.append("  （无队员）")
+            for member in team.members:
+                lines.append(
+                    f"  - {member.name} [{member.agent_id}] {member.agent_type} "
+                    f"@{member.backend_type} {state_text[member.is_active]}"
+                    f" worktree={member.worktree_path}"
+                )
+        await self._system("\n".join(lines))
+
+    # ---------- 第 11 章：Skill 管理 ----------
+
+    async def _handle_skill_command(self, command) -> None:
+        """TUI 版 /skill：list / info / reload。"""
+        parts = command.argument.split(maxsplit=1) if command.argument else []
+        sub = parts[0].lower() if parts else "list"
+        host = self.skill_host
+        if sub == "list":
+            skills = host.loader.load_catalog()
+            if not skills:
+                await self._system("暂无 Skill。可放入 ~/.mewcode/skills/ 或 项目根/.mewcode/skills/。")
+                return
+            lines = ["已加载 Skill："]
+            for skill in sorted(skills, key=lambda s: s.source_rank):
+                marker = "项目" if skill.source_rank == 0 else "用户" if skill.source_rank == 1 else "内置"
+                lines.append(f"  {skill.name:<16} [{marker}] {skill.description}")
+            lines.append(f"（共 {len(skills)} 个）")
+            await self._system("\n".join(lines))
+        elif sub == "info":
+            if len(parts) < 2:
+                await self._system(command_usage(command))
+                return
+            name = parts[1].strip().lower()
+            try:
+                skill = host.loader.get(name)
+            except Exception as exc:
+                await self._system(str(exc))
+                return
+            lines = [
+                f"名称：{skill.name}",
+                f"描述：{skill.description}",
+                f"模式：{skill.mode}（context={skill.context}）",
+                f"模型：{skill.model or '默认'}",
+                f"来源：{skill.source}",
+                f"允许工具：{', '.join(skill.allowed_tools) if skill.allowed_tools else '（全部）'}",
+            ]
+            await self._system("\n".join(lines))
+        elif sub == "reload":
+            names = host.reload()
+            await self._system(f"已重新扫描 Skill：{', '.join(names) if names else '（无）'}")
+        else:
+            await self._system(command_usage(command))
+
+    # ---------- 第 13 章：子 Agent 任务管理 ----------
+
+    async def _handle_tasks_command(self, command) -> None:
+        """/tasks：TUI 版——列出后台子 Agent 任务与调用链。"""
+        tasks = self.task_manager.list_tasks()
+        lines = [f"后台任务（共 {len(tasks)} 个）："]
+        if not tasks:
+            lines.append("  （无）")
+        for task in tasks:
+            elapsed = task.end_time - task.start_time if task.end_time is not None else None
+            duration = f"{elapsed:.1f}s" if elapsed is not None else "进行中"
+            tokens = task.progress.input_tokens + task.progress.output_tokens
+            lines.append(f"  [{task.id}] {task.name} — {task.status}（{duration}，{tokens} token）")
+        lines.append("")
+        lines.append(self.trace.tree_text())
+        await self._system("\n".join(lines))
+
+    async def _handle_task_command(self, command) -> None:
+        """/task：TUI 版——info <ID> / cancel <ID>。"""
+        parts = command.argument.split(maxsplit=2) if command.argument else []
+        if not parts or len(parts) < 2:
+            await self._system(command_usage(command))
+            return
+        action, task_id = parts[0].lower(), parts[1].strip()
+        task = self.task_manager.get(task_id)
+        if task is None:
+            await self._system(f"任务不存在：{task_id}")
+            return
+        if action in ("info", "show"):
+            elapsed = task.end_time - task.start_time if task.end_time is not None else None
+            duration = f"{elapsed:.1f}s" if elapsed is not None else "进行中"
+            lines = [
+                f"任务：{task.id}（{task.name}）",
+                f"状态：{task.status}",
+                f"耗时：{duration}",
+                f"Token：{task.progress.input_tokens + task.progress.output_tokens}",
+            ]
+            if task.result:
+                lines.append("--- 结果 ---")
+                lines.append(task.result)
+            await self._system("\n".join(lines))
+        elif action == "cancel":
+            if task.status == "running":
+                self.task_manager.cancel(task_id)
+                await self._system(f"已请求取消任务：{task_id}")
+            else:
+                await self._system(f"任务 {task_id} 已结束（{task.status}），无需取消。")
+        else:
+            await self._system(command_usage(command))
 
     # ---------- TUI 扩展命令辅助方法 ----------
 
     async def _start_new_session(self) -> None:
         self._save()
         self.session = Session(model=self.config.model)
+        self.skill_host.state.clear()  # 第 11 章：激活的 Skill 跟着对话走
         await self._render_session()
         self._show_welcome()
         await self._system(f"已创建新会话：{self.session.id}")
@@ -523,6 +741,52 @@ class MewCodeTUI(TextualApp[None]):
         self._save()
         self.exit()
 
+    async def on_unmount(self) -> None:
+        """第 12 章：退出兜底——session_end + shutdown 事件（覆盖 /exit 与 ctrl+c 路径）。"""
+        if getattr(self, "hooks", None) is not None:
+            await self.hooks.run_hooks(LifecycleEvent.SESSION_END, HookContext(event_name=LifecycleEvent.SESSION_END))
+            await self.hooks.run_hooks(LifecycleEvent.SHUTDOWN, HookContext(event_name=LifecycleEvent.SHUTDOWN))
+            self.hooks.shutdown()
+        # 第 13 章：退出时取消所有仍在运行的后台子 Agent 任务
+        self.task_manager.shutdown()
+        # 第 15 章：停掉所有仍在运行的 in-process 队员
+        self.team_manager.shutdown()
+
+    # ---------- 第 11 章：Skill fork 模式 ----------
+
+    async def _run_sub_agent(self, skill, prompt: str, context_messages: list, host) -> str:
+        """fork 模式：开一个独立子 Agent（独立 session + 过滤工具）执行。
+
+        TUI 是自实现流式对话，这里用独立的临时 Session + client.stream
+        收集文本结果，然后由 SkillHost 回流主对话。
+        """
+        from .llm_client import LLMError, StreamEnd, TextDelta
+
+        sub_session = Session(model=skill.model or self.config.model)
+        # 按 skill.context 决定带多少主对话上下文
+        if skill.context == "recent":
+            for msg in context_messages[-5:]:
+                sub_session.messages.append(msg)
+        elif skill.context == "full":
+            sub_session.messages.extend(context_messages)
+
+        # allowedTools 过滤工具集（LoadSkill 始终可见）
+        filtered = host.filter_registry(skill.allowed_tools) if host is not None else None
+        tools_specs = filtered.api_specs() if filtered is not None else self.registry.api_specs()
+
+        collected: list[str] = []
+        try:
+            async for event in self.client.stream(
+                [{"role": "system", "content": self._system_prompt()}] + sub_session.api_messages()
+            ):
+                if isinstance(event, TextDelta):
+                    collected.append(event.text)
+                elif isinstance(event, StreamEnd):
+                    break
+        except (LLMError, Exception) as exc:  # noqa: BLE001 - fork 失败给出错误文本
+            collected.append(f"（fork 执行失败：{exc}）")
+        return "".join(collected)
+
     async def _run_mcp_command(self) -> None:
         await self._handle_mcp_command()
 
@@ -553,7 +817,7 @@ class MewCodeTUI(TextualApp[None]):
         yield ScrollableContainer(id="conversation")
         with Horizontal(id="composer"):
             yield Static(">", id="prompt-mark")
-            yield Input(
+            yield CommandInput(
                 placeholder="",
                 id="prompt",
             )
@@ -566,6 +830,14 @@ class MewCodeTUI(TextualApp[None]):
 
     async def on_mount(self) -> None:
         self._refresh_status("已连接")
+        # 第 12 章：startup + session_start 事件——MewCode 启动、新会话开始时触发
+        if self.hooks is not None:
+            await self.hooks.run_hooks(
+                LifecycleEvent.STARTUP, HookContext(event_name=LifecycleEvent.STARTUP)
+            )
+            await self.hooks.run_hooks(
+                LifecycleEvent.SESSION_START, HookContext(event_name=LifecycleEvent.SESSION_START)
+            )
         if self.session.messages:
             self._show_work()
             await self._render_session()
@@ -578,7 +850,7 @@ class MewCodeTUI(TextualApp[None]):
 
     # ---------- 第 10 章：命令补全 ----------
 
-    async def action_command_complete(self) -> None:
+    def action_command_complete(self) -> None:
         """Tab 补全：输入框以 / 开头时显示候选命令列表。"""
         prompt = self.query_one("#prompt", Input)
         value = prompt.value
@@ -587,7 +859,7 @@ class MewCodeTUI(TextualApp[None]):
             return
         self.completion_popup.show(value)
 
-    async def action_dismiss_completion(self) -> None:
+    def action_dismiss_completion(self) -> None:
         self.completion_popup.hide()
         self.query_one("#prompt", Input).focus()
 
@@ -763,16 +1035,81 @@ class MewCodeTUI(TextualApp[None]):
     # ---------- 单流对话编排 ----------
 
     def _system_prompt(self) -> str:
-        """组装 system prompt：核心模块 + 环境 + 第 9 章指令与记忆注入。"""
+        """组装 system prompt：核心模块 + 环境 + 第 9 章指令与记忆 + 第 11 章 Skill 摘要。"""
         instructions = load_instructions(self.workdir)
+        # 第 15 章：Coordinator Mode 双锁——激活后注入四阶段工作流提示词
+        if self._coordinator_mode_active():
+            from .teams import get_coordinator_system_prompt, get_coordinator_user_context
+
+            instructions = (
+                instructions
+                + "\n\n"
+                + get_coordinator_system_prompt()
+                + "\n"
+                + get_coordinator_user_context()["workerToolsContext"]
+            )
         memory_index = self.memory.load_index() if self.auto_memory else ""
+        skill_catalog = self.skill_host.loader.catalog_text() if getattr(self.skill_host, "loader", None) else ""
         return build_system_prompt(
             env=detect_environment(self.workdir, model=self.config.model),
             options=BuildOptions(
                 custom_instructions=instructions,
                 memory_instructions=memory_index,
+                skill_instructions=skill_catalog,
             ),
         )
+
+    # ---------- 第 15 章：Agent Teams ----------
+
+    def _coordinator_mode_active(self) -> bool:
+        """双锁判定：feature flag（config.yaml）+ 环境变量（用户显式 opt-in）。"""
+        from .teams import coordinator_env_enabled, coordinator_feature_enabled
+
+        return coordinator_feature_enabled(self.workdir) and coordinator_env_enabled()
+
+    def _drain_lead_mailbox(self) -> list[dict[str, Any]]:
+        """每轮请求前消费 Lead 邮箱（空闲通知 / 队员消息 → system reminder）。"""
+        from .teams import format_mailbox_digest
+
+        digest_parts: list[str] = []
+        try:
+            teams = self.team_manager.list_teams()
+        except Exception:  # noqa: BLE001 - 邮箱消费失败不阻断对话
+            return []
+        for team in teams:
+            mailbox = self.team_manager.get_mailbox(team.name)
+            if mailbox is None:
+                continue
+            digest = format_mailbox_digest(mailbox.consume(team.lead_agent_id))
+            if digest:
+                digest_parts.append(f"[团队 {team.name}]\n{digest}")
+        joined = "\n\n".join(digest_parts)
+        if not joined:
+            return []
+        return [{"role": "user", "content": f"<system-reminder>\n{joined}\n</system-reminder>"}]
+
+    def _lead_task_store_provider(self):
+        """Lead 侧共享任务工具的 store provider：按当前活跃团队动态解析。"""
+        from .teams import TeamError
+
+        team_name = self.team_manager.active_team_name
+        store = self.team_manager.get_task_store(team_name) if team_name else None
+        if store is None:
+            raise TeamError("当前没有活跃团队：先用 TeamCreate 创建团队。")
+        return store
+
+    def _build_coordinator_registry(self):
+        """Coordinator 模式的收窄注册中心（不改动宿主完整工具集）。"""
+        from .teams import build_coordinator_registry, build_team_task_tools
+
+        team_tools: dict[str, Any] = {
+            self.team_create_tool.name: self.team_create_tool,
+            self.team_delete_tool.name: self.team_delete_tool,
+            self.team_send_tool.name: self.team_send_tool,
+        }
+        for task_tool in build_team_task_tools(self._lead_task_store_provider):
+            team_tools[task_tool.name] = task_tool
+        return build_coordinator_registry(self.registry, team_tools)
 
     # ---------- 第 10 章命令 ----------
 
@@ -917,7 +1254,9 @@ class MewCodeTUI(TextualApp[None]):
     def _refresh_client_tools(self) -> None:
         """同步客户端携带的工具描述（注册中心可能新增 MCP 工具）。"""
         if hasattr(self.client, "tools"):
-            self.client.tools = self.registry.api_specs()
+            # 第 15 章：Coordinator Mode 下用收窄后的工具集（无 WriteFile/EditFile）
+            registry = getattr(self, "_coordinator_registry", None) or self.registry
+            self.client.tools = registry.api_specs()
 
     async def _handle_mcp_command(self) -> None:
         """/mcp 命令：查看 MCP Server 连接状态与注册的工具。"""
@@ -991,6 +1330,13 @@ class MewCodeTUI(TextualApp[None]):
         self.session.add_message("user", text)
         await self._append_row(f"你  › {text}", classes="user-row")
         self._refresh_status("生成中")
+        # 第 15 章：Coordinator Mode 双锁——激活后本轮对话用收窄工具集
+        self._coordinator_registry = self._build_coordinator_registry() if self._coordinator_mode_active() else None
+        # 第 12 章：turn_start 事件——用户发送新消息时触发
+        if self.hooks is not None:
+            await self.hooks.run_hooks(
+                LifecycleEvent.TURN_START, HookContext(event_name=LifecycleEvent.TURN_START, message=text)
+            )
         try:
             turn = 0
             max_turns = 10
@@ -1014,6 +1360,7 @@ class MewCodeTUI(TextualApp[None]):
         except Exception as exc:  # noqa: BLE001 - UI 层兜底，避免异常吞掉输入框
             await self._system(f"处理出错：{exc}")
         finally:
+            self._coordinator_registry = None  # 第 15 章：本轮对话结束，恢复完整工具集
             self._cancel_pending_cards()
             self._busy = False
             prompt.disabled = False
@@ -1021,6 +1368,28 @@ class MewCodeTUI(TextualApp[None]):
             self._refresh_status("已连接")
             self._save()
             self._schedule_memory_extraction()
+            # 第 13 章：轮次结束后拉取已完成的子 Agent 任务并注入对话
+            self._collect_task_notifications()
+            # 第 12 章：turn_end 事件——Agent 完成回复时触发
+            if self.hooks is not None:
+                await self.hooks.run_hooks(
+                    LifecycleEvent.TURN_END, HookContext(event_name=LifecycleEvent.TURN_END, message=text)
+                )
+
+    def _collect_task_notifications(self) -> None:
+        """把已完成的后台子 Agent 结果写入会话（TUI 版，异步回传）。"""
+        completed = self.task_manager.poll_completed()
+        for task in completed:
+            if not task.result:
+                continue
+            notice = (
+                f"<task-notification>\n"
+                f"后台任务 {task.name}（{task.id}）已完成，状态：{task.status}。\n"
+                f"结果：\n{task.result}\n"
+                f"</task-notification>"
+            )
+            self.session.add_message("user", notice)
+            self._save()
 
     def _schedule_memory_extraction(self) -> None:
         """第 9 章：每轮对话结束后后台异步提取记忆（达到阈值才真正调用 LLM）。"""
@@ -1055,7 +1424,39 @@ class MewCodeTUI(TextualApp[None]):
         stream_row: Static | None = None
         try:
             # 第 9 章：system prompt 注入指令文件与记忆索引，随后是完整会话历史
-            messages = [{"role": "system", "content": self._system_prompt()}] + self.session.api_messages()
+            # 第 11 章：env context 每轮重建——已激活 Skill 的 SOP 钉在最前
+            messages: list[dict[str, Any]] = []
+            # 第 12 章：Hook 的 prompt 执行器注入——以 system-reminder 形式
+            # 注入到请求首部，Agent 在开始本轮思考前读到
+            if self.hooks is not None:
+                for hook_message in self.hooks.get_prompt_messages():
+                    if hook_message:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": f"<system-reminder>\n{hook_message}\n</system-reminder>",
+                            }
+                        )
+            # 第 15 章：Lead 邮箱消费——队员空闲通知 / 消息在每轮请求前注入
+            messages.extend(self._drain_lead_mailbox())
+            if self.skill_host.state.sop_texts():
+                from .commands import CommandContext
+
+                # 复用 executor 的 SOP 注入格式（system-reminder 标签）
+                sop_text = "\n\n".join(self.skill_host.state.sop_texts())
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"<system-reminder>\n以下 Skill 已激活，请遵循其中的 SOP：\n\n{sop_text}\n</system-reminder>",
+                    }
+                )
+            messages.append({"role": "system", "content": self._system_prompt()})
+            messages.extend(self.session.api_messages())
+            # 第 12 章：pre_send 事件——消息发送给 LLM 之前（可注入 prompt 提示词）
+            if self.hooks is not None:
+                await self.hooks.run_hooks(
+                    LifecycleEvent.PRE_SEND, HookContext(event_name=LifecycleEvent.PRE_SEND)
+                )
             async for event in self.client.stream(messages):
                 if isinstance(event, TextDelta):
                     collected.append(event.text)
@@ -1083,6 +1484,11 @@ class MewCodeTUI(TextualApp[None]):
         finally:
             if stream_row is not None and not collected and not pending:
                 stream_row.remove()
+        # 第 12 章：post_receive 事件——收到 LLM 响应之后
+        if self.hooks is not None:
+            await self.hooks.run_hooks(
+                LifecycleEvent.POST_RECEIVE, HookContext(event_name=LifecycleEvent.POST_RECEIVE)
+            )
         uses: list[ToolUseBlock] = []
         for index, slot in sorted(pending.items()):
             raw = slot["args"]
@@ -1121,15 +1527,43 @@ class MewCodeTUI(TextualApp[None]):
                 row = Static(Text(f"⎿ ⎿ {label} ⠋", style=COLOR_ORANGE))
                 await self._conversation().mount(row)
                 self._card_tasks[index] = asyncio.create_task(self._spinner(row, label))
-            # 五层权限检查：放行则执行，拦截则直接生成失败结果
-            denied_result = await self._permission_check(use)
-            if denied_result is not None:
-                result = denied_result
+            # 第 12 章：pre_tool_use Hook 先置安全拦截——权限链之前检查，
+            # 命中 reject 直接生成拦截结果（reason 即 Hook 输出）
+            hook_rejection = None
+            if self.hooks is not None:
+                hook_ctx = HookContext(
+                    event_name=LifecycleEvent.PRE_TOOL_USE,
+                    tool_name=use.name,
+                    tool_args=use.input,
+                    file_path=str(use.input.get("file_path") or use.input.get("path") or ""),
+                )
+                hook_rejection = await self.hooks.run_pre_tool_hooks(hook_ctx)
+            if hook_rejection is not None:
+                result = ToolResult(is_error=True, error=hook_rejection.reason)
             else:
-                try:
-                    result = await self.registry.execute(use.name, use.input)
-                except Exception as exc:  # noqa: BLE001 - 未知工具/异常统一转为失败结果
-                    result = ToolResult(is_error=True, error=str(exc) or f"{use.name} 执行失败")
+                # 五层权限检查：放行则执行，拦截则直接生成失败结果
+                denied_result = await self._permission_check(use)
+                if denied_result is not None:
+                    result = denied_result
+                else:
+                    try:
+                        # 第 15 章：Coordinator Mode 下工具执行同样走收窄注册中心
+                        registry = self._coordinator_registry or self.registry
+                        result = await registry.execute(use.name, use.input)
+                    except Exception as exc:  # noqa: BLE001 - 未知工具/异常统一转为失败结果
+                        result = ToolResult(is_error=True, error=str(exc) or f"{use.name} 执行失败")
+            # 第 12 章：post_tool_use 事件——工具执行完成之后
+            if self.hooks is not None:
+                await self.hooks.run_hooks(
+                    LifecycleEvent.POST_TOOL_USE,
+                    HookContext(
+                        event_name=LifecycleEvent.POST_TOOL_USE,
+                        tool_name=use.name,
+                        tool_args=use.input,
+                        file_path=str(use.input.get("file_path") or use.input.get("path") or ""),
+                        error=result.error if result.is_error else "",
+                    ),
+                )
             task = self._card_tasks.pop(index, None)
             if task is not None:
                 task.cancel()

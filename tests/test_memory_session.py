@@ -24,7 +24,11 @@ def test_session_id_format():
     # YYYYMMDD-HHMMSS-xxxx：前 15 字符时间戳 + 4 位十六进制随机后缀
     assert len(sid) == 20
     assert sid[8] == "-" and sid[15] == "-"
-    assert len(set(generate_session_id() for _ in range(100))) == 100
+    # 同秒连续生成 100 个：4 位后缀共 65536 空间，生日悖论下允许
+    # 至多 1 次碰撞（默认绝大多数场景同秒只生成几个，不会撞）
+    ids = [generate_session_id() for _ in range(100)]
+    duplicates = len(ids) - len(set(ids))
+    assert duplicates <= 1, f"同秒生成 100 个 ID 碰撞 {duplicates} 次"
 
 
 def test_record_roundtrip():

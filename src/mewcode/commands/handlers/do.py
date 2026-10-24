@@ -17,7 +17,6 @@ DO_COMMAND = Command(
     type=CommandType.LOCAL_UI,
     handler=handle_do,
     usage="/do",
-    arg_prompt="用法：/do",
 )
 
 __all__ = ["DO_COMMAND"]

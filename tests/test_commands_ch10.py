@@ -54,14 +54,13 @@ async def test_status_alias_s(tmp_path):
 @pytest.mark.asyncio
 async def test_review_sends_prompt_to_agent(tmp_path):
     """PROMPT 类型命令：/review 触发一轮 Agent 对话。"""
+    from mewcode.commands.handlers.review import REVIEW_PROMPT
+
     client = ScriptedClient([text_turn("审查完成，一切正常")])
     app, output = make_app(tmp_path, client)
-    # 模拟 run_async 的 review 分支
-    from .commands.handlers.review import REVIEW_PROMPT
-
+    # 模拟 run_async 的 review 分支：直接把 REVIEW_PROMPT 交给 Agent
     await app._ask(REVIEW_PROMPT)
     assert "审查完成" in output.getvalue()
-    # review prompt 作为首条用户消息注入
     assert client.requests[-1][0]["role"] == "system"
 
 
@@ -111,8 +110,8 @@ async def test_registry_is_wired_into_app(tmp_path):
     assert app.commands.find("c") is not None
     assert app.commands.find("status") is not None
     assert app.commands.find("exit") is not None
-    # 补全候选
-    assert "/com" in app.commands.complete("/com")
+    # 补全候选：输入 /com → 候选列表含 /compact
+    assert "/compact" in app.commands.complete("/com")
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +123,7 @@ async def test_registry_is_wired_into_app(tmp_path):
 async def test_tui_tab_completion_shows_popup(tmp_path):
     from mewcode.tui import MewCodeTUI
     from mewcode.tools import ToolRegistry
+    from textual.widgets import Input
 
     app = MewCodeTUI(
         PROVIDER,
@@ -133,6 +133,7 @@ async def test_tui_tab_completion_shows_popup(tmp_path):
     )
     async with app.run_test() as pilot:
         await pilot.pause()
+        # 输入框输入 /c 后触发 Tab 补全（真实按键流）
         await pilot.press("/", "c")
         await pilot.press("tab")
         await pilot.pause()
@@ -141,7 +142,7 @@ async def test_tui_tab_completion_shows_popup(tmp_path):
         from textual.widgets import OptionList
 
         ol = app.completion_popup.query_one("#completion-list", OptionList)
-        assert len(ol.option_count) >= 1
+        assert ol.option_count >= 1
         await pilot.press("escape")
         await pilot.pause()
         assert app.completion_popup.display is False
