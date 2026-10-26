@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1536" viewBox="0 0 1024 1536" font-family="Microsoft YaHei, PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#5B7A9E"/>
+    </marker>
+    <marker id="arrD" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#DC2626"/>
+    </marker>
+  </defs>
+
+  <!-- 背景 -->
+  <rect x="0" y="0" width="1024" height="1536" fill="#F6F8FB"/>
+
+  <!-- 顶部标题栏 -->
+  <rect x="0" y="0" width="1024" height="150" fill="#1F3A5F"/>
+  <circle cx="84" cy="75" r="34" fill="#2E5B8F"/>
+  <text x="84" y="88" font-size="36" fill="#FFFFFF" text-anchor="middle" font-weight="bold">!</text>
+  <text x="140" y="64" font-size="42" fill="#FFFFFF" font-weight="bold">传统 RAG 的缺陷</text>
+  <text x="140" y="112" font-size="24" fill="#B9D0EA">查询时才临时找资料：碎片化检索的四大痛点</text>
+
+  <!-- ============ 上半部分：流程示意 ============ -->
+  <!-- 节点1 文档库 -->
+  <rect x="40" y="200" width="180" height="190" rx="16" fill="#FFFFFF" stroke="#D6E2F0" stroke-width="2"/>
+  <rect x="70" y="235" width="120" height="16" rx="4" fill="#E8EFF7"/>
+  <rect x="60" y="258" width="130" height="16" rx="4" fill="#E8EFF7"/>
+  <rect x="65" y="281" width="125" height="16" rx="4" fill="#E8EFF7"/>
+  <rect x="72" y="304" width="118" height="16" rx="4" fill="#E8EFF7"/>
+  <text x="130" y="352" font-size="21" fill="#334155" text-anchor="middle" font-weight="bold">文档库</text>
+  <text x="130" y="378" font-size="16" fill="#64748B" text-anchor="middle">原始资料语料</text>
+
+  <!-- 箭头1 -->
+  <line x1="220" y1="295" x2="278" y2="295" stroke="#5B7A9E" stroke-width="3" marker-end="url(#arr)"/>
+
+  <!-- 节点2 硬切分 -->
+  <rect x="288" y="200" width="188" height="190" rx="16" fill="#FFFFFF" stroke="#F3C9C9" stroke-width="3"/>
+  <text x="382" y="244" font-size="21" fill="#B91C1C" text-anchor="middle" font-weight="bold">硬切分＋向量化</text>
+  <!-- 碎片小方块 -->
+  <rect x="312" y="268" width="36" height="30" rx="6" fill="#FDA4A4"/>
+  <rect x="356" y="262" width="42" height="30" rx="6" fill="#FCA5A5"/>
+  <rect x="406" y="272" width="38" height="30" rx="6" fill="#FECACA"/>
+  <rect x="330" y="310" width="40" height="30" rx="6" fill="#F87171"/>
+  <rect x="382" y="306" width="40" height="30" rx="6" fill="#FB7185"/>
+  <text x="382" y="372" font-size="16" fill="#B91C1C" text-anchor="middle">固定长度切块</text>
+
+  <!-- 箭头2 -->
+  <line x1="476" y1="295" x2="534" y2="295" stroke="#5B7A9E" stroke-width="3" marker-end="url(#arr)"/>
+
+  <!-- 节点3 向量库 -->
+  <rect x="544" y="200" width="180" height="190" rx="16" fill="#FFFFFF" stroke="#D6E2F0" stroke-width="2"/>
+  <ellipse cx="634" cy="266" rx="62" ry="22" fill="#BFDBFE"/>
+  <rect x="572" y="266" width="124" height="74" fill="#DBEAFE"/>
+  <ellipse cx="634" cy="340" rx="62" ry="22" fill="#93C5FD"/>
+  <text x="634" y="376" font-size="21" fill="#334155" text-anchor="middle" font-weight="bold">向量数据库</text>
+  <text x="634" y="382" font-size="16" fill="#64748B" text-anchor="middle"></text>
+
+  <!-- 箭头3 -->
+  <line x1="724" y1="295" x2="782" y2="295" stroke="#5B7A9E" stroke-width="3" marker-end="url(#arr)"/>
+
+  <!-- 节点4 检索拼接 -->
+  <rect x="792" y="200" width="192" height="190" rx="16" fill="#FFFFFF" stroke="#F3C9C9" stroke-width="3"/>
+  <!-- 放大镜 -->
+  <circle cx="838" cy="272" r="22" fill="none" stroke="#B91C1C" stroke-width="5"/>
+  <line x1="853" y1="288" x2="876" y2="312" stroke="#B91C1C" stroke-width="6" stroke-linecap="round"/>
+  <text x="888" y="248" font-size="18" fill="#B91C1C" text-anchor="middle" font-weight="bold">top-k 召回</text>
+  <!-- 拼接的碎片 -->
+  <rect x="836" y="322" width="34" height="20" rx="5" fill="#FCA5A5"/>
+  <rect x="876" y="328" width="34" height="20" rx="5" fill="#FDA4A4"/>
+  <rect x="916" y="318" width="30" height="20" rx="5" fill="#FECACA"/>
+  <text x="888" y="376" font-size="16" fill="#B91C1C" text-anchor="middle">机械拼接</text>
+
+  <!-- 下行箭头：向量库->LLM 和 检索->LLM -->
+  <line x1="634" y1="430" x2="634" y2="470" stroke="#5B7A9E" stroke-width="3" marker-end="url(#arr)"/>
+  <line x1="888" y1="430" x2="888" y2="470" stroke="#DC2626" stroke-width="3" stroke-dasharray="6,5" marker-end="url(#arrD)"/>
+
+  <!-- LLM 生成回答 -->
+  <rect x="420" y="478" width="300" height="120" rx="16" fill="#FFFFFF" stroke="#D6E2F0" stroke-width="2"/>
+  <rect x="430" y="492" width="280" height="92" rx="10" fill="#EEF2FF"/>
+  <text x="570" y="534" font-size="26" fill="#1D4ED8" text-anchor="middle" font-weight="bold">大语言模型</text>
+  <text x="570" y="566" font-size="17" fill="#475569" text-anchor="middle">在超长拼接上下文中生成回答</text>
+
+  <!-- 回答气泡 -->
+  <ellipse cx="790" cy="538" rx="108" ry="46" fill="#DBEAFE"/>
+  <polygon points="700,556 668,588 716,568" fill="#DBEAFE"/>
+  <text x="790" y="540" font-size="22" fill="#1E40AF" text-anchor="middle" font-weight="bold">回答</text>
+
+  <!-- ============ 下半部分：四个缺陷卡片 ============ -->
+  <text x="60" y="636" font-size="30" fill="#B91C1C" font-weight="bold">四大缺陷</text>
+
+  <!-- 卡片1 -->
+  <rect x="60" y="664" width="904" height="176" rx="18" fill="#FFFFFF" stroke="#FECACA" stroke-width="2.5"/>
+  <rect x="60" y="664" width="10" height="176" rx="5" fill="#DC2626"/>
+  <circle cx="116" cy="752" r="40" fill="#DC2626"/>
+  <text x="116" y="762" font-size="34" fill="#FFFFFF" text-anchor="middle" font-weight="bold">1</text>
+  <text x="184" y="730" font-size="27" fill="#7F1D1D" font-weight="bold">碎片化切分，上下文断裂</text>
+  <text x="184" y="768" font-size="19" fill="#475569">文档按固定长度被硬切成孤立片段，段落逻辑与章节前因后果被拦腰截断，</text>
+  <text x="184" y="798" font-size="19" fill="#475569">检索到手的往往是「缺头少尾」的碎片，跨段语义联系天然丢失。</text>
+
+  <!-- 卡片2 -->
+  <rect x="60" y="860" width="904" height="176" rx="18" fill="#FFFFFF" stroke="#FECACA" stroke-width="2.5"/>
+  <rect x="60" y="860" width="10" height="176" rx="5" fill="#DC2626"/>
+  <circle cx="116" cy="948" r="40" fill="#DC2626"/>
+  <text x="116" y="958" font-size="34" fill="#FFFFFF" text-anchor="middle" font-weight="bold">2</text>
+  <text x="184" y="926" font-size="27" fill="#7F1D1D" font-weight="bold">固定检索策略，召回不全</text>
+  <text x="184" y="964" font-size="19" fill="#475569">top-k 相似度检索只看词面与向量距离，跨章节、跨文档的隐性联系召回不到，</text>
+  <text x="184" y="994" font-size="19" fill="#475569">复杂问题常检索到不相关片段——论文实测跨单元类问题得分仅 8.14/10。</text>
+
+  <!-- 卡片3 -->
+  <rect x="60" y="1056" width="904" height="176" rx="18" fill="#FFFFFF" stroke="#FECACA" stroke-width="2.5"/>
+  <rect x="60" y="1056" width="10" height="176" rx="5" fill="#DC2626"/>
+  <circle cx="116" cy="1144" r="40" fill="#DC2626"/>
+  <text x="116" y="1154" font-size="34" fill="#FFFFFF" text-anchor="middle" font-weight="bold">3</text>
+  <text x="184" y="1122" font-size="27" fill="#7F1D1D" font-weight="bold">拼接片段，上下文超长、成本高</text>
+  <text x="184" y="1160" font-size="19" fill="#475569">多个检索片段被机械拼进 Prompt，挤占上下文窗口，稀释模型注意力，</text>
+  <text x="184" y="1190" font-size="19" fill="#475569">推理质量不升反降，Token 成本也随片段数量水涨船高。</text>
+
+  <!-- 卡片4 -->
+  <rect x="60" y="1252" width="904" height="176" rx="18" fill="#FFFFFF" stroke="#FECACA" stroke-width="2.5"/>
+  <rect x="60" y="1252" width="10" height="176" rx="5" fill="#DC2626"/>
+  <circle cx="116" cy="1340" r="40" fill="#DC2626"/>
+  <text x="116" y="1350" font-size="34" fill="#FFFFFF" text-anchor="middle" font-weight="bold">4</text>
+  <text x="184" y="1318" font-size="27" fill="#7F1D1D" font-weight="bold">来源不可追溯，易生幻觉</text>
+  <text x="184" y="1356" font-size="19" fill="#475569">碎片与原始出处失去关联，模型难以交代依据来自哪里；</text>
+  <text x="184" y="1386" font-size="19" fill="#475569">论文实测跨单元问题仅 64% 的回答有引用支撑，其余难以核实。</text>
+
+  <!-- 底部 -->
+  <text x="512" y="1486" font-size="18" fill="#94A3B8" text-anchor="middle">资料来源：arXiv 2609.25303 对照实验（向量 RAG vs LLM 编译 Wiki）</text>
+</svg>
