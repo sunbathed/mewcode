@@ -42,7 +42,7 @@ from .plan_mode import (
 from .prompt_pipeline import hook_notification_message, system_reminder_message
 from ..permission import PermissionChecker, PermissionDecision, PermissionResponse
 from ..hooks import HookContext, HookEngine, ToolRejectedError
-from ..hooks.models import LifecycleEvent
+from ..hooks.models import LifecycleEvent, WRITE_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +300,15 @@ class Agent:
                             )
                         yield ErrorEvent(compact_error)
                     elif outcome is not None:
+                        # 第 12 章：compact 事件——上下文压缩成功时触发
+                        if self.hooks is not None:
+                            await self.hooks.run_hooks(
+                                LifecycleEvent.COMPACT,
+                                HookContext(
+                                    event_name=LifecycleEvent.COMPACT,
+                                    message=_compact_summary(outcome),
+                                ),
+                            )
                         yield ContextCompactedEvent(
                             reason=outcome.reason,
                             before_tokens=outcome.before_tokens,
@@ -355,6 +364,12 @@ class Agent:
                         yield LoopCompleteEvent(turn, AgentStopReason.INTERNAL_ERROR)
                         return
                     if outcome is not None and outcome.performed:
+                        # 第 12 章：compact 事件——紧急压缩同样触发（$MESSAGE 描述）
+                        if self.hooks is not None:
+                            await self.hooks.run_hooks(
+                                LifecycleEvent.COMPACT,
+                                HookContext(event_name=LifecycleEvent.COMPACT, message=_compact_summary(outcome)),
+                            )
                         yield ContextCompactedEvent(
                             reason="force",
                             before_tokens=outcome.before_tokens,
@@ -475,6 +490,17 @@ class Agent:
                     continue
                 if decision.decision == PermissionDecision.ASK:
                     # 第 5 层 HITL：发出权限请求事件并阻塞等待 UI 层回复
+                    # 第 12 章：permission_request 事件——权限审批请求时触发
+                    if self.hooks is not None:
+                        await self.hooks.run_hooks(
+                            LifecycleEvent.PERMISSION_REQUEST,
+                            HookContext(
+                                event_name=LifecycleEvent.PERMISSION_REQUEST,
+                                tool_name=use.name,
+                                tool_args=use.input,
+                                message=self._permission_description(use),
+                            ),
+                        )
                     future = asyncio.get_running_loop().create_future()
                     yield PermissionRequestEvent(
                         request_id=use.id,
@@ -531,6 +557,21 @@ class Agent:
                             error=result.error if result.is_error else "",
                         ),
                     )
+                    # file_change 事件——写文件工具成功修改文件后触发
+                    if (
+                        use.name in WRITE_TOOL_NAMES
+                        and not result.is_error
+                        and self._hook_file_path(use)
+                    ):
+                        await self.hooks.run_hooks(
+                            LifecycleEvent.FILE_CHANGE,
+                            HookContext(
+                                event_name=LifecycleEvent.FILE_CHANGE,
+                                tool_name=use.name,
+                                tool_args=use.input,
+                                file_path=self._hook_file_path(use),
+                            ),
+                        )
 
             # 停止条件 5：连续多轮工具失败（模型可能已迷失）
             # 权限拒绝（DENY/HITL 拒绝）不算执行失败——模型看到
@@ -652,6 +693,15 @@ class Agent:
         logger.warning(
             "Hook '%s' rejected tool '%s': %s", rejection.hook_id, rejection.tool, rejection.reason
         )
+
+
+def _compact_summary(outcome: CompactOutcome) -> str:
+    """把压缩结果渲染成 compact 事件的消息文本（$MESSAGE 可替换）。"""
+    freed = max(0, outcome.before_tokens - outcome.after_tokens)
+    return (
+        f"上下文已压缩：{outcome.before_tokens:,} → {outcome.after_tokens:,} token"
+        f"（释放 {freed:,}，原因 {outcome.reason}）"
+    )
 
 
 __all__ = ["Agent", "AgentConfig", "_default_system_prompt", "_estimate_tokens"]

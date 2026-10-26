@@ -46,6 +46,11 @@ class LifecycleEvent(enum.StrEnum):
     COMMAND_EXECUTE = "command_execute"
 
 
+# 会修改文件系统的内置工具名集合：file_change 事件只在这些工具
+# 执行成功时触发（写失败属于 error 场景，不构成「文件被修改」）。
+WRITE_TOOL_NAMES = frozenset({"WriteFile", "EditFile", "ReplaceInFile"})
+
+
 @dataclass(slots=True)
 class Hook:
     """一条 Hook 规则：事件 + 条件 + 动作，外加三个执行控制标记。"""
@@ -174,4 +179,5 @@ __all__ = [
     "HookContext",
     "LifecycleEvent",
     "ToolRejectedError",
+    "WRITE_TOOL_NAMES",
 ]

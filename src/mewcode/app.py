@@ -54,7 +54,7 @@ from .terminal import SPINNER_FRAMES, Terminal
 from .tools import ToolRegistry, ToolResult
 from .mcp import MCPManager
 from .hooks import HookEngine, HookContext, load_hooks
-from .hooks.models import LifecycleEvent
+from .hooks.models import LifecycleEvent, WRITE_TOOL_NAMES
 from .subagent import AgentLoader, AgentTool, TaskManager, TraceRegistry
 from .subagent.task_tools import TaskGetTool, TaskListTool
 
@@ -855,6 +855,18 @@ class App:
             f"已压缩：{outcome.before_tokens:,} → {outcome.after_tokens:,} token"
             f"（释放 {max(0, outcome.before_tokens - outcome.after_tokens):,}）"
         )
+        # 第 12 章：compact 事件——手动 /compact 压缩成功同样触发
+        if self.hooks is not None:
+            await self.hooks.run_hooks(
+                LifecycleEvent.COMPACT,
+                HookContext(
+                    event_name=LifecycleEvent.COMPACT,
+                    message=(
+                        f"手动压缩：{outcome.before_tokens:,} → {outcome.after_tokens:,} token"
+                        f"（释放 {max(0, outcome.before_tokens - outcome.after_tokens):,}）"
+                    ),
+                ),
+            )
         self._save()
 
     async def _ask(self, text: str) -> None:
@@ -1099,6 +1111,15 @@ class App:
                     continue
                 command = parse_command(text)
                 if command is not None:
+                    # 第 12 章：command_execute 事件——Slash Command 执行时触发
+                    if self.hooks is not None:
+                        await self.hooks.run_hooks(
+                            LifecycleEvent.COMMAND_EXECUTE,
+                            HookContext(
+                                event_name=LifecycleEvent.COMMAND_EXECUTE,
+                                message=text,
+                            ),
+                        )
                     # 第 8 章：/compact 需异步调用 LLM 生成摘要，单独走异步分支
                     if command.name == "compact":
                         await self._handle_compact_command()

@@ -35,7 +35,7 @@ from .llm_client import (
 )
 from .memory import MemoryManager, MemoryManagerError, load_instructions
 from .hooks import HookContext
-from .hooks.models import LifecycleEvent
+from .hooks.models import LifecycleEvent, WRITE_TOOL_NAMES
 from .permission import (
     MODE_ALIASES,
     PermissionChecker,
@@ -1021,6 +1021,15 @@ class MewCodeTUI(TextualApp[None]):
         # 补全弹窗还开着时收到命令输入，先关掉
         if self.completion_popup.display:
             self.completion_popup.hide()
+        # 第 12 章：command_execute 事件——Slash Command 执行时触发
+        if self.hooks is not None:
+            raw_text = f"/{command.name}"
+            if command.argument:
+                raw_text += f" {command.argument}"
+            await self.hooks.run_hooks(
+                LifecycleEvent.COMMAND_EXECUTE,
+                HookContext(event_name=LifecycleEvent.COMMAND_EXECUTE, message=raw_text),
+            )
         cmd = self.commands.find(command.name)
         if cmd is None:
             await self._system(command_usage(command))
@@ -1163,6 +1172,18 @@ class MewCodeTUI(TextualApp[None]):
             f"已压缩：{outcome.before_tokens:,} → {outcome.after_tokens:,} token"
             f"（释放 {max(0, outcome.before_tokens - outcome.after_tokens):,}）"
         )
+        # 第 12 章：compact 事件——手动 /compact 压缩成功同样触发
+        if self.hooks is not None:
+            await self.hooks.run_hooks(
+                LifecycleEvent.COMPACT,
+                HookContext(
+                    event_name=LifecycleEvent.COMPACT,
+                    message=(
+                        f"手动压缩：{outcome.before_tokens:,} → {outcome.after_tokens:,} token"
+                        f"（释放 {max(0, outcome.before_tokens - outcome.after_tokens):,}）"
+                    ),
+                ),
+            )
         self._save()
 
     async def _handle_session_command(self, command) -> None:
@@ -1306,6 +1327,17 @@ class MewCodeTUI(TextualApp[None]):
         if decision.decision == PermissionDecision.ASK:
             # 第 5 层 HITL：弹出确认对话框，等待用户回复
             # 注意：wait_for_dismiss=True 时 push_screen 返回 dismiss 的结果（须在 worker 中调用）
+            # 第 12 章：permission_request 事件——权限审批请求时触发
+            if self.hooks is not None:
+                await self.hooks.run_hooks(
+                    LifecycleEvent.PERMISSION_REQUEST,
+                    HookContext(
+                        event_name=LifecycleEvent.PERMISSION_REQUEST,
+                        tool_name=use.name,
+                        tool_args=use.input,
+                        message=self._permission_description(use),
+                    ),
+                )
             response = await self.push_screen(
                 PermissionModal(use.name, self._permission_description(use)),
                 wait_for_dismiss=True,
@@ -1554,16 +1586,28 @@ class MewCodeTUI(TextualApp[None]):
                         result = ToolResult(is_error=True, error=str(exc) or f"{use.name} 执行失败")
             # 第 12 章：post_tool_use 事件——工具执行完成之后
             if self.hooks is not None:
+                hook_file_path = str(use.input.get("file_path") or use.input.get("path") or "")
                 await self.hooks.run_hooks(
                     LifecycleEvent.POST_TOOL_USE,
                     HookContext(
                         event_name=LifecycleEvent.POST_TOOL_USE,
                         tool_name=use.name,
                         tool_args=use.input,
-                        file_path=str(use.input.get("file_path") or use.input.get("path") or ""),
+                        file_path=hook_file_path,
                         error=result.error if result.is_error else "",
                     ),
                 )
+                # file_change 事件——写文件工具成功修改文件后触发
+                if use.name in WRITE_TOOL_NAMES and not result.is_error and hook_file_path:
+                    await self.hooks.run_hooks(
+                        LifecycleEvent.FILE_CHANGE,
+                        HookContext(
+                            event_name=LifecycleEvent.FILE_CHANGE,
+                            tool_name=use.name,
+                            tool_args=use.input,
+                            file_path=hook_file_path,
+                        ),
+                    )
             task = self._card_tasks.pop(index, None)
             if task is not None:
                 task.cancel()
